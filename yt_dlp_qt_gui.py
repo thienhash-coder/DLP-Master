@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import json
 import shutil
 import sys
 import tempfile
@@ -9,6 +10,9 @@ import threading
 import time
 import traceback
 import uuid
+import urllib.error
+import urllib.request
+import webbrowser
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -97,7 +101,15 @@ BASE_DIR = Path(__file__).resolve().parent
 DOWNLOAD_DIR = BASE_DIR / "downloads"
 MAX_CONCURRENT_DOWNLOADS = 2
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-VERSION = "1.1.0"
+VERSION = "2.0.0"
+
+try:
+    from app_config import APP_NAME as CONFIG_APP_NAME, CURRENT_VERSION as CONFIG_CURRENT_VERSION, UPDATE_URL
+except Exception:
+    CONFIG_APP_NAME = "DLP Master"
+    CONFIG_CURRENT_VERSION = VERSION
+    UPDATE_URL = ""
+
 PLATFORM_LOGIN_URLS = {
     "TikTok": "https://www.tiktok.com/login",
     "YouTube": "https://accounts.google.com/signin/v2/identifier?service=youtube",
@@ -166,6 +178,75 @@ class CapturedCookie:
     secure: bool
     expires: int
     http_only: bool
+
+
+@dataclass
+class ReleaseInfo:
+    version: str
+    download_url: str
+    notes: str = ""
+
+
+def parse_version_tuple(version_text: str) -> tuple[int, ...]:
+    parts = re.findall(r"\d+", str(version_text))
+    return tuple(int(part) for part in parts)
+
+
+def is_remote_version_newer(remote_version: str, local_version: str) -> bool:
+    remote_tuple = parse_version_tuple(remote_version)
+    local_tuple = parse_version_tuple(local_version)
+    if remote_tuple and local_tuple:
+        max_len = max(len(remote_tuple), len(local_tuple))
+        remote_norm = remote_tuple + (0,) * (max_len - len(remote_tuple))
+        local_norm = local_tuple + (0,) * (max_len - len(local_tuple))
+        return remote_norm > local_norm
+    return str(remote_version).strip().lower() != str(local_version).strip().lower()
+
+
+def parse_release_info(raw_payload: str) -> ReleaseInfo | None:
+    text = (raw_payload or "").strip()
+    if not text:
+        return None
+
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        payload = None
+
+    if isinstance(payload, dict):
+        version = str(
+            payload.get("version")
+            or payload.get("latest_version")
+            or payload.get("tag_name")
+            or ""
+        ).strip()
+        version = version.lstrip("vV")
+        download_url = str(
+            payload.get("download_url")
+            or payload.get("url")
+            or payload.get("html_url")
+            or payload.get("release_url")
+            or ""
+        ).strip()
+        notes = str(payload.get("notes") or payload.get("changelog") or "").strip()
+
+        assets = payload.get("assets")
+        if not download_url and isinstance(assets, list):
+            for asset in assets:
+                if not isinstance(asset, dict):
+                    continue
+                candidate = str(asset.get("browser_download_url") or asset.get("url") or "").strip()
+                if candidate:
+                    download_url = candidate
+                    break
+
+        if version or download_url:
+            return ReleaseInfo(version=version, download_url=download_url, notes=notes)
+
+    if text.lower().startswith(("http://", "https://")):
+        return ReleaseInfo(version="", download_url=text)
+
+    return ReleaseInfo(version=text.lstrip("vV"), download_url="")
 
 
 class DownloadSignals(QObject):
@@ -929,6 +1010,10 @@ class MainWindow(QMainWindow):
         super().__init__()
         DOWNLOAD_DIR.mkdir(exist_ok=True)
 
+        self.current_version = (str(CONFIG_CURRENT_VERSION).strip() or VERSION).lstrip("vV")
+        self.update_url = str(UPDATE_URL).strip()
+        self.latest_release_url = ""
+
         self.settings = AppSettings(output_dir=self.get_default_download_dir())
         self.pending_queue: deque[DownloadTask] = deque()
         self.active_threads: dict[str, tuple[QThread, DownloadWorker]] = {}
@@ -952,8 +1037,15 @@ class MainWindow(QMainWindow):
             self.append_log("info", "[hệ thống] Qt WebEngine sẵn sàng cho đăng nhập nhúng.")
         else:
             self.append_log("warning", "[hệ thống] Chưa có Qt WebEngine. Cài PyQt6-WebEngine để dùng đăng nhập nhúng.")
+        self.append_log("info", f"[hệ thống] Phiên bản ứng dụng: v{self.current_version}")
+        if self.current_version != VERSION:
+            self.append_log(
+                "warning",
+                f"[hệ thống] app_config CURRENT_VERSION (v{self.current_version}) khác VERSION mã nguồn (v{VERSION}).",
+            )
         self.append_log("info", f"[hệ thống] Thư mục lưu mặc định: {self.settings.output_dir}")
         self.update_cookie_status()
+        QTimer.singleShot(1500, self.check_for_updates_silent)
 
     def get_default_download_dir(self) -> str:
         default_dir = os.path.join(os.path.expanduser("~"), "Downloads")
@@ -1142,11 +1234,22 @@ class MainWindow(QMainWindow):
         self.sponsorblock_checkbox = QCheckBox("Cắt quảng cáo với SponsorBlock")
         self.sponsorblock_checkbox.setChecked(self.settings.sponsorblock)
 
+        update_row = QHBoxLayout()
+        self.update_info_label = QLabel(f"Phiên bản hiện tại: v{self.current_version}")
+        self.update_info_label.setObjectName("Hint")
+        self.check_update_button = QPushButton("Kiểm tra cập nhật")
+        self.check_update_button.setObjectName("SettingsButton")
+        self.check_update_button.clicked.connect(lambda: self.check_for_updates(manual=True))
+        update_row.addWidget(self.update_info_label)
+        update_row.addStretch(1)
+        update_row.addWidget(self.check_update_button)
+
         layout.addLayout(row1)
         layout.addWidget(self.write_subs_checkbox)
         layout.addWidget(self.embed_subs_checkbox)
         layout.addWidget(self.embed_thumb_checkbox)
         layout.addWidget(self.sponsorblock_checkbox)
+        layout.addLayout(update_row)
         layout.addLayout(folder_row)
         layout.addWidget(self.cookie_status)
         layout.addStretch(1)
@@ -1639,6 +1742,92 @@ class MainWindow(QMainWindow):
             self.cookie_status.setText(f"Cookie đang sử dụng: {self.settings.cookie_file}")
         else:
             self.cookie_status.setText("Cookie mode: Public/Ẩn danh (chưa đăng nhập)")
+
+    def fetch_release_info(self) -> ReleaseInfo | None:
+        if not self.update_url:
+            return None
+
+        req = urllib.request.Request(
+            self.update_url,
+            headers={"User-Agent": f"{CONFIG_APP_NAME}/{self.current_version}"},
+        )
+        with urllib.request.urlopen(req, timeout=8) as response:
+            body = response.read().decode("utf-8", errors="replace")
+        return parse_release_info(body)
+
+    def check_for_updates_silent(self):
+        self.check_for_updates(manual=False)
+
+    def check_for_updates(self, manual: bool = False):
+        if not self.update_url:
+            self.append_log("warning", "[update] Chưa cấu hình UPDATE_URL trong app_config.py")
+            if manual:
+                QMessageBox.information(self, "Cập nhật", "Chưa cấu hình UPDATE_URL để kiểm tra phiên bản.")
+            return
+
+        try:
+            release = self.fetch_release_info()
+        except urllib.error.URLError as err:
+            self.append_log("warning", f"[update] Không thể kiểm tra cập nhật: {clean_log_text(err)}")
+            if manual:
+                QMessageBox.warning(self, "Cập nhật", f"Không thể kiểm tra cập nhật:\n{clean_log_text(err)}")
+            return
+        except Exception as err:
+            self.append_log("error", f"[update] Lỗi kiểm tra cập nhật: {clean_log_text(err)}")
+            if manual:
+                QMessageBox.critical(self, "Cập nhật", f"Lỗi kiểm tra cập nhật:\n{clean_log_text(err)}")
+            return
+
+        if not release:
+            self.append_log("warning", "[update] UPDATE_URL phản hồi rỗng hoặc sai định dạng.")
+            if manual:
+                QMessageBox.warning(self, "Cập nhật", "Không đọc được dữ liệu phiên bản từ UPDATE_URL.")
+            return
+
+        if release.download_url:
+            self.latest_release_url = release.download_url
+
+        remote_version = (release.version or "").strip().lstrip("vV")
+        if remote_version and is_remote_version_newer(remote_version, self.current_version):
+            self.append_log(
+                "warning",
+                f"[update] Có phiên bản mới v{remote_version} (hiện tại v{self.current_version}).",
+            )
+            if release.download_url:
+                ask = QMessageBox.question(
+                    self,
+                    "Có bản cập nhật mới",
+                    (
+                        f"Đã có phiên bản mới v{remote_version}.\n"
+                        f"Phiên bản hiện tại: v{self.current_version}.\n\n"
+                        "Bạn có muốn mở trang tải bản mới không?"
+                    ),
+                )
+                if ask == QMessageBox.StandardButton.Yes:
+                    webbrowser.open(release.download_url)
+            elif manual:
+                QMessageBox.information(
+                    self,
+                    "Có bản cập nhật mới",
+                    f"Đã có phiên bản mới v{remote_version}, nhưng chưa có link tải trong version.json.",
+                )
+            return
+
+        if not remote_version and release.download_url:
+            self.append_log("info", "[update] Đã nhận link phát hành, nhưng thiếu trường version để so sánh.")
+            if manual:
+                ask = QMessageBox.question(
+                    self,
+                    "Thông tin cập nhật",
+                    "Đã nhận link phát hành nhưng thiếu số phiên bản. Mở trang phát hành ngay?",
+                )
+                if ask == QMessageBox.StandardButton.Yes:
+                    webbrowser.open(release.download_url)
+            return
+
+        self.append_log("info", f"[update] Đang ở phiên bản mới nhất (v{self.current_version}).")
+        if manual:
+            QMessageBox.information(self, "Cập nhật", f"Bạn đang ở phiên bản mới nhất: v{self.current_version}")
 
     def open_login_dialog(self):
         if not WEBENGINE_AVAILABLE:
