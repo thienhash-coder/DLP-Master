@@ -1,6 +1,5 @@
 const { app, BrowserWindow } = require('electron');
 const { autoUpdater } = require('electron-updater');
-const path = require('path');
 
 let mainWindow;
 
@@ -10,24 +9,36 @@ function createWindow() {
     height: 800,
     webPreferences: {
       nodeIntegration: true,
-    }
+    },
   });
 
-  // Trỏ vào file index.html từ Vibe Code của bạn
-  mainWindow.loadFile('index.html'); 
+  mainWindow.loadFile('index.html');
 
-  mainWindow.on('closed', function () {
+  mainWindow.on('closed', () => {
     mainWindow = null;
   });
 }
 
-app.on('ready', () => {
+app.whenReady().then(() => {
   createWindow();
-  // Khởi chạy tiến trình kiểm tra cập nhật ngầm khi mở app
-  autoUpdater.checkForUpdatesAndNotify();
+
+  if (app.isPackaged) {
+    autoUpdater.checkForUpdatesAndNotify();
+  }
 });
 
-// Khi có bản cập nhật mới, tự động tải về và báo cho khách
+app.on('window-all-closed', () => {
+  if (process.platform !== 'darwin') {
+    app.quit();
+  }
+});
+
+app.on('activate', () => {
+  if (BrowserWindow.getAllWindows().length === 0) {
+    createWindow();
+  }
+});
+
 autoUpdater.on('update-downloaded', () => {
-  autoUpdater.quitAndInstall(); // Tự đóng app cũ và cài bản mới đè lên
+  autoUpdater.quitAndInstall();
 });
