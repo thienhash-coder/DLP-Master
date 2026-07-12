@@ -1,110 +1,81 @@
 # DLP Master
 
-DLP Master is a desktop/web downloader interface built on top of `yt-dlp`. It provides a simple Vietnamese UI for downloading videos, playlists, channels, and audio with common presets such as best quality, MP4, and MP3.
-
-The project bundles the `yt_dlp` Python package as the download core and wraps the interface with Electron so the app can be packaged for Windows and updated through GitHub Releases.
+DLP Master is a Qt desktop downloader interface built on top of `yt-dlp`. It provides a Vietnamese UI for downloading videos, playlists, channels, and audio with common presets such as MP4, MKV, MP3, and FLAC.
 
 ## Features
 
 - Download video, playlist, or channel URLs using `yt-dlp`
-- Choose best quality, MP4 video, or MP3 audio
-- Optional metadata, thumbnail, subtitle, SponsorBlock, and Chrome cookie support
-- Admin login with live download logs over WebSocket
-- Electron packaging with `electron-builder`
-- Auto-update support through GitHub Releases via `electron-updater`
+- Queue manager with parallel downloads
+- MP4, MKV, MP3, and FLAC output presets
+- Optional subtitle, thumbnail, and SponsorBlock processing
+- Embedded login (Qt WebEngine) for capturing cookies
+- Release update check from `version.json`
 
 ## Project Structure
 
 ```text
-main.js              Electron main process and auto-update hook
-index.html           Downloader UI
-fastapi-main.py      FastAPI backend used by the UI
+yt_dlp_qt_gui.py     Main Qt GUI application
+yt_dlp_qt_gui.spec   PyInstaller spec (single executable folder build)
+DLP Master Qt.spec   PyInstaller spec including ffmpeg binaries
+app_config.py        App name/version/update URL settings
+version.json         Release metadata consumed by update checker
 yt_dlp/              Bundled yt-dlp core
 downloads/           Default download output directory
-package.json         Electron build and release configuration
+tools/ffmpeg/bin/    Bundled ffmpeg and ffprobe for packaged app
 ```
 
 ## Requirements
 
-- Node.js and npm
 - Python 3.10+
-- FFmpeg and FFprobe available on PATH for merging, metadata, thumbnails, and MP3 conversion
+- PyQt6 or PySide6
+- Optional: `PyQt6-WebEngine` for embedded login/cookie capture
+- FFmpeg and FFprobe (already bundled under `tools/ffmpeg/bin` for packaged build)
 
 ## Development
 
-Install Node dependencies:
+Run the Qt app directly:
 
 ```bash
-npm install
+python yt_dlp_qt_gui.py
 ```
 
-Run the FastAPI backend:
+If WebEngine is not installed:
 
 ```bash
-python -m uvicorn fastapi-main:app --host 127.0.0.1 --port 8000 --reload
+pip install PyQt6-WebEngine
 ```
 
-Run the Electron app:
+The app reads update settings from:
 
-```bash
-npm start
-```
-
-The default admin account in the current development config is:
-
-```text
-Username: admin
-Password: password123
-```
-
-Change `SECRET_KEY`, `ADMIN_USERNAME`, and `ADMIN_PASSWORD` in `fastapi-main.py` before sharing or deploying the app.
+- `app_config.py` (`CURRENT_VERSION`, `UPDATE_URL`)
+- `version.json` (release version and download URL)
 
 ## Build
 
-Create a Windows package:
+Create a Windows Qt package with bundled ffmpeg:
 
 ```bash
-npm run dist
+python -m PyInstaller --noconfirm "DLP Master Qt.spec"
 ```
 
-For a quick unpacked build check:
+Build output is written to `dist/DLP Master Qt/`.
+
+Create a release zip:
 
 ```bash
-npm run dist -- --dir
+PowerShell Compress-Archive -Path "dist\DLP Master Qt\*" -DestinationPath "dist\DLP-Master-Qt-vX.Y.Z-win64.zip"
 ```
-
-Build output is written to `dist/`.
 
 ## Releases and Auto Update
 
-Auto-update is configured for:
+Qt GUI checks for updates at startup and via manual button in Settings.
 
-```text
-https://github.com/thienhash-coder/dlp-master
-```
+Update flow:
+1. App reads `UPDATE_URL` from `app_config.py`.
+2. App fetches `version.json`.
+3. If newer version exists, app prompts user and opens `download_url`.
 
-To publish a new release:
-
-1. Commit all changes.
-2. Increase the app version:
-
-```bash
-npm version patch
-```
-
-3. Set a GitHub token that can create releases:
-
-```powershell
-$env:GH_TOKEN="YOUR_GITHUB_TOKEN"
-```
-
-4. Build and publish:
-
-```bash
-npm run publish
-```
-
-Installed app builds check GitHub Releases on startup. Development runs skip update checks.
+Note: current updater is prompt-and-open-link, not silent auto-install.
 
 ## GitHub Setup
 

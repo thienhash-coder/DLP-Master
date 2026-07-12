@@ -5,7 +5,6 @@
   - `yt_dlp_qt_gui.py` (`VERSION`)
   - `app_config.py` (`CURRENT_VERSION`)
   - `version.json` (`version` + `download_url`)
-  - `package.json` (`version`) if Electron release is included
 - [ ] Run local sanity test: start `dist/DLP Master Qt/DLP Master Qt.exe`
 - [ ] Verify update check in app:
   - Settings page button `Kiểm tra cập nhật` works
