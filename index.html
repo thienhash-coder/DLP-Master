@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>yt-dlp WebUI</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        ::-webkit-scrollbar { width: 5px; height: 5px; }
+        ::-webkit-scrollbar-track { background: #111827; }
+        ::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 4px; }
+    </style>
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen flex flex-col font-sans">
+    <header class="border-b border-gray-800 bg-gray-900 px-6 py-4 flex justify-between items-center shadow-md">
+        <div class="flex items-center gap-3">
+            <div class="bg-red-600 p-2 rounded-lg text-white"><i class="fa-solid fa-cloud-arrow-down text-xl"></i></div>
+            <div>
+                <h1 class="text-base font-bold tracking-wide flex items-center gap-2">
+                    yt-dlp Web Downloader
+                    <span id="badgeAdmin" class="hidden text-[10px] bg-red-950 text-red-300 border border-red-800 px-2 py-0.5 rounded font-mono font-bold uppercase tracking-wider">Admin</span>
+                </h1>
+                <p class="text-xs text-gray-400">Tai video, playlist va audio bang core yt-dlp trong repo nay</p>
+            </div>
+        </div>
+        <button id="btnAuth" onclick="toggleAuthModal()" class="bg-gray-800 hover:bg-gray-700 text-gray-200 border border-gray-700 px-4 py-1.5 rounded-lg text-xs font-medium transition flex items-center gap-2">
+            <i class="fa-solid fa-lock"></i> Dang nhap Admin
+        </button>
+    </header>
+
+    <main class="flex-1 grid grid-cols-1 lg:grid-cols-12 gap-6 p-6 overflow-hidden">
+        <section id="leftColumn" class="lg:col-span-12 flex flex-col gap-6 overflow-y-auto duration-300">
+            <div class="bg-gray-900 border border-gray-800 rounded-xl p-6 shadow-xl">
+                <label for="videoUrl" class="block text-sm font-medium text-gray-300 mb-2.5">Lien ket video, playlist hoac kenh can tai</label>
+                <div class="flex flex-col sm:flex-row gap-3">
+                    <div class="relative flex-1">
+                        <i class="fa-solid fa-link absolute left-4 top-4 text-gray-500"></i>
+                        <input id="videoUrl" type="url" placeholder="https://www.youtube.com/watch?v=..."
+                               class="w-full bg-gray-950 border border-gray-700 rounded-xl pl-11 pr-4 py-3.5 text-sm focus:outline-none focus:border-red-500 text-gray-200 placeholder-gray-500">
+                    </div>
+                    <button id="btnDownload" onclick="startDownload()" class="bg-red-600 hover:bg-red-700 disabled:bg-gray-700 disabled:cursor-not-allowed text-white font-semibold px-8 py-3.5 rounded-xl shadow-lg shadow-red-950/30 transition flex items-center justify-center gap-2">
+                        <i class="fa-solid fa-arrow-down"></i> Bat dau tai
+                    </button>
+                </div>
+                <p id="downloadError" class="hidden mt-3 text-xs text-red-400"></p>
+            </div>
+
+            <div class="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden shadow-xl">
+                <div class="px-5 py-3.5 border-b border-gray-800 flex justify-between items-center">
+                    <h2 class="text-xs font-bold uppercase tracking-wider text-gray-400 flex items-center gap-2">
+                        <i class="fa-solid fa-sliders text-red-500"></i> Tuy chon tai
+                    </h2>
+                    <span id="coreVersion" class="text-[11px] text-gray-500">yt-dlp ...</span>
+                </div>
+                <div class="p-5 grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
+                    <div>
+                        <label for="preset" class="block text-gray-400 mb-1.5 font-medium">Dinh dang uu tien</label>
+                        <select id="preset" class="w-full bg-gray-950 border border-gray-700 rounded-lg p-2.5 focus:border-red-500 outline-none text-gray-300">
+                            <option value="best">Best quality</option>
+                            <option value="mp4">MP4 video</option>
+                            <option value="mp3">MP3 audio</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label for="cookies" class="block text-gray-400 mb-1.5 font-medium">Cookies</label>
+                        <select id="cookies" class="w-full bg-gray-950 border border-gray-700 rounded-lg p-2.5 focus:border-red-500 outline-none text-gray-300">
+                            <option value="no">Khong dung cookies</option>
+                            <option value="chrome">Lay cookies tu Chrome tren may chu</option>
+                        </select>
+                    </div>
+                    <div class="md:col-span-2 pt-2 grid grid-cols-1 sm:grid-cols-2 gap-3 text-gray-300">
+                        <label class="flex items-center gap-2 cursor-pointer"><input id="embedMetadata" type="checkbox" checked class="rounded accent-red-600"> Nhung metadata</label>
+                        <label class="flex items-center gap-2 cursor-pointer"><input id="embedThumbnail" type="checkbox" checked class="rounded accent-red-600"> Nhung thumbnail</label>
+                        <label class="flex items-center gap-2 cursor-pointer"><input id="writeSubs" type="checkbox" class="rounded accent-red-600"> Tai phu de neu co</label>
+                        <label class="flex items-center gap-2 cursor-pointer"><input id="sponsorblock" type="checkbox" class="rounded accent-red-600"> Danh dau SponsorBlock</label>
+                    </div>
+                </div>
+            </div>
+
+            <div id="adminSettingsSection" class="hidden bg-gray-900 border border-gray-800 rounded-xl p-5 shadow-xl grid grid-cols-1 sm:grid-cols-3 gap-4 text-center">
+                <div class="bg-gray-950 p-4 rounded-xl border border-gray-800">
+                    <p class="text-xs text-gray-400 mb-1">Thu muc tai</p>
+                    <p id="downloadDir" class="text-xs font-mono text-gray-300 truncate">...</p>
+                </div>
+                <div class="bg-gray-950 p-4 rounded-xl border border-gray-800">
+                    <p class="text-xs text-gray-400 mb-1">Dung luong trong</p>
+                    <p id="freeDisk" class="text-lg font-bold text-emerald-400">...</p>
+                </div>
+                <div class="bg-gray-950 p-4 rounded-xl border border-gray-800">
+                    <p class="text-xs text-gray-400 mb-1">Trang thai</p>
+                    <p class="text-sm font-bold text-blue-400">San sang</p>
+                </div>
+            </div>
+        </section>
+
+        <aside id="adminLogColumn" class="hidden lg:col-span-5 flex flex-col h-full overflow-hidden bg-black border border-gray-800 rounded-xl p-4 font-mono text-xs shadow-2xl">
+            <div class="flex justify-between items-center text-gray-400 border-b border-gray-900 pb-2.5 mb-3">
+                <span class="font-bold text-red-500"><i class="fa-solid fa-terminal"></i> Live log</span>
+                <span id="wsStatus" class="text-[10px] bg-gray-900 px-2 py-0.5 rounded text-gray-500">Disconnected</span>
+            </div>
+            <div id="terminalLog" class="flex-1 overflow-y-auto space-y-1.5 text-gray-300 text-[11px] leading-relaxed">
+                <p class="text-gray-500">Dang cho ket noi WebSocket...</p>
+            </div>
+        </aside>
+    </main>
+
+    <div id="authModal" class="hidden fixed inset-0 bg-black/80 flex items-center justify-center p-4 z-50 backdrop-blur-sm">
+        <div class="bg-gray-900 border border-gray-800 rounded-2xl w-full max-w-sm p-6 shadow-2xl relative">
+            <button onclick="toggleAuthModal()" class="absolute right-4 top-4 text-gray-500 hover:text-white text-sm"><i class="fa-solid fa-xmark"></i></button>
+            <h3 class="text-base font-bold mb-4 text-center"><i class="fa-solid fa-shield-halved text-red-500"></i> Dang nhap Admin</h3>
+            <div class="space-y-3 text-xs">
+                <div>
+                    <label for="username" class="block text-gray-400 mb-1">Tai khoan</label>
+                    <input type="text" id="username" value="admin" class="w-full bg-gray-950 border border-gray-700 rounded-lg p-2.5 outline-none focus:border-red-500">
+                </div>
+                <div>
+                    <label for="password" class="block text-gray-400 mb-1">Mat khau</label>
+                    <input type="password" id="password" value="password123" class="w-full bg-gray-950 border border-gray-700 rounded-lg p-2.5 outline-none focus:border-red-500">
+                </div>
+                <p id="authError" class="text-red-400 text-[11px] hidden"></p>
+                <button onclick="handleLogin()" class="w-full bg-red-600 hover:bg-red-700 font-bold py-2.5 rounded-lg transition mt-2 text-sm">Xac nhan</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let wsConn;
+
+        function apiBase() {
+            return window.location.origin;
+        }
+
+        function toggleAuthModal() {
+            document.getElementById('authModal').classList.toggle('hidden');
+        }
+
+        function appendLog(type, message) {
+            const term = document.getElementById('terminalLog');
+            let colorClass = 'text-gray-300';
+            if (type === 'warning') colorClass = 'text-yellow-400';
+            if (type === 'success') colorClass = 'text-green-400';
+            if (type === 'error') colorClass = 'text-red-500 font-bold';
+            if (type === 'download') colorClass = 'text-blue-400';
+            term.innerHTML += `<p class="${colorClass}">${message}</p>`;
+            term.scrollTop = term.scrollHeight;
+        }
+
+        async function loadStatus() {
+            try {
+                const response = await fetch(`${apiBase()}/api/status`);
+                const data = await response.json();
+                document.getElementById('coreVersion').innerText = `yt-dlp ${data.version}`;
+                document.getElementById('downloadDir').innerText = data.download_dir;
+                document.getElementById('freeDisk').innerText = `${data.free_gb} GB`;
+            } catch (err) {
+                document.getElementById('coreVersion').innerText = 'API chua san sang';
+            }
+        }
+
+        async function checkAuth() {
+            const token = localStorage.getItem('admin_token');
+            if (!token) return;
+
+            document.getElementById('badgeAdmin').classList.remove('hidden');
+            document.getElementById('adminSettingsSection').classList.remove('hidden');
+            document.getElementById('adminLogColumn').classList.remove('hidden');
+
+            const leftCol = document.getElementById('leftColumn');
+            leftCol.classList.remove('lg:col-span-12');
+            leftCol.classList.add('lg:col-span-7');
+
+            document.getElementById('btnAuth').innerHTML = '<i class="fa-solid fa-right-from-bracket"></i> Dang xuat';
+            document.getElementById('btnAuth').setAttribute('onclick', 'handleLogout()');
+            connectWebSocket(token);
+        }
+
+        async function handleLogin() {
+            const user = document.getElementById('username').value;
+            const pass = document.getElementById('password').value;
+            const errBox = document.getElementById('authError');
+
+            try {
+                const response = await fetch(`${apiBase()}/api/login`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username: user, password: pass })
+                });
+
+                if (!response.ok) throw new Error('Thong tin dang nhap sai');
+
+                const data = await response.json();
+                localStorage.setItem('admin_token', data.access_token);
+                toggleAuthModal();
+                await checkAuth();
+            } catch (err) {
+                errBox.innerText = err.message;
+                errBox.classList.remove('hidden');
+            }
+        }
+
+        function handleLogout() {
+            localStorage.removeItem('admin_token');
+            if (wsConn) wsConn.close();
+            window.location.reload();
+        }
+
+        function connectWebSocket(token) {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            wsConn = new WebSocket(`${protocol}//${window.location.host}/ws/logs`);
+            const term = document.getElementById('terminalLog');
+
+            wsConn.onopen = () => {
+                document.getElementById('wsStatus').innerText = 'Connected';
+                wsConn.send(JSON.stringify({ token: token }));
+                term.innerHTML = '';
+            };
+
+            wsConn.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                appendLog(data.type, data.message);
+            };
+
+            wsConn.onclose = () => {
+                document.getElementById('wsStatus').innerText = 'Disconnected';
+            };
+        }
+
+        async function startDownload() {
+            const errBox = document.getElementById('downloadError');
+            const button = document.getElementById('btnDownload');
+            errBox.classList.add('hidden');
+
+            const url = document.getElementById('videoUrl').value.trim();
+            if (!url) {
+                errBox.innerText = 'Hay nhap URL can tai';
+                errBox.classList.remove('hidden');
+                return;
+            }
+
+            button.disabled = true;
+            try {
+                const response = await fetch(`${apiBase()}/api/download`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        url,
+                        preset: document.getElementById('preset').value,
+                        embed_metadata: document.getElementById('embedMetadata').checked,
+                        embed_thumbnail: document.getElementById('embedThumbnail').checked,
+                        write_subs: document.getElementById('writeSubs').checked,
+                        sponsorblock: document.getElementById('sponsorblock').checked,
+                        cookies_from_browser: document.getElementById('cookies').value === 'chrome'
+                    })
+                });
+                const data = await response.json();
+                if (!response.ok) throw new Error(data.detail || 'Khong the bat dau tai');
+                appendLog('info', data.message);
+            } catch (err) {
+                errBox.innerText = err.message;
+                errBox.classList.remove('hidden');
+            } finally {
+                button.disabled = false;
+            }
+        }
+
+        window.onload = async () => {
+            await loadStatus();
+            await checkAuth();
+        };
+    </script>
+</body>
+</html>

@@ -1,0 +1,29 @@
+{
+  "name": "yt-dlp",
+  "version": "1.0.0",
+  "description": "<!-- MANPAGE: BEGIN EXCLUDED SECTION -->\r <div align=\"center\">",
+  "main": "index.js",
+  "directories": {
+    "test": "test"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/thienhash-coder/yt-dlp.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/thienhash-coder/yt-dlp/issues"
+  },
+  "homepage": "https://github.com/thienhash-coder/yt-dlp#readme",
+  "devDependencies": {
+    "electron": "^43.1.0",
+    "electron-builder": "^26.15.3",
+    "electron-updater": "^6.8.9"
+  }
+}
