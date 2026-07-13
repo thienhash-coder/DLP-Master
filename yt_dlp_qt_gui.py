@@ -4,6 +4,7 @@ import os
 import re
 import json
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -101,7 +102,7 @@ BASE_DIR = Path(__file__).resolve().parent
 DOWNLOAD_DIR = BASE_DIR / "downloads"
 MAX_CONCURRENT_DOWNLOADS = 2
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-VERSION = "2.0.0"
+VERSION = "2.0.1"
 
 try:
     from app_config import APP_NAME as CONFIG_APP_NAME, CURRENT_VERSION as CONFIG_CURRENT_VERSION, UPDATE_URL
@@ -114,6 +115,8 @@ PLATFORM_LOGIN_URLS = {
     "TikTok": "https://www.tiktok.com/login",
     "YouTube": "https://accounts.google.com/signin/v2/identifier?service=youtube",
     "Facebook": "https://www.facebook.com/login",
+    "Douyin (抖音)": "https://www.douyin.com/?show_login=1",
+    "Kuaishou (快手 - YT Trung Quốc)": "https://www.kuaishou.com/"
 }
 
 PLATFORM_AUTH_COOKIE_HINTS = {
@@ -128,6 +131,14 @@ PLATFORM_AUTH_COOKIE_HINTS = {
     "Facebook": {
         "domains": ("facebook.com",),
         "auth_cookies": {"c_user", "xs", "fr", "datr"},
+    },
+    "Douyin (抖音)": {
+        "domains": ("douyin.com", "amemv.com"),
+        "auth_cookies": {"passport_csrf_token", "sessionid", "sessionid_ss", "uid_tt", "sid_tt", "odin_tt"},
+    },
+    "Kuaishou (快手 - YT Trung Quốc)": {
+        "domains": ("kuaishou.com", "gifshow.com"),
+        "auth_cookies": {"kpf", "kpn", "clientid", "did", "didv", "passToken", "userId"},
     },
 }
 
@@ -329,10 +340,15 @@ class DownloadWorker(QObject):
         target_dir = self.settings.output_dir.strip() or str(DOWNLOAD_DIR)
         Path(target_dir).mkdir(parents=True, exist_ok=True)
         opts = {
-            "outtmpl": os.path.join(target_dir, "%(title)s.%(ext)s"),
+            # SỬA DÒNG NÀY: Giới hạn tiêu đề video lấy tối đa 100 ký tự để tránh lỗi quá dài
+            "outtmpl": os.path.join(target_dir, "%(title).100s.%(ext)s"),
             "logger": QtYtDlpLogger(self.signals, self.task.task_id, is_cancelled=self.stop_event.is_set),
             "progress_hooks": [self.progress_hook],
+            
+            # BỔ SUNG 2 DÒNG NÀY: Ép buộc tên file tuân thủ quy tắc Windows và loại bỏ ký tự lạ ASCII
             "windowsfilenames": True,
+            "restrictfilenames": True,  # Loại bỏ khoảng trắng phức tạp, dấu tiếng Việt và ký tự đặc biệt gây lỗi
+            
             "retries": 3,
             "fragment_retries": 3,
             "extractor_retries": 3,
@@ -349,6 +365,14 @@ class DownloadWorker(QObject):
         if self.settings.output_format == "MP4":
             opts["format"] = "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b"
             opts["merge_output_format"] = "mp4"
+        elif self.settings.output_format == "MP4 (Convert)":
+            opts["format"] = "bv*+ba/b"
+            postprocessors.append(
+                {
+                    "key": "FFmpegVideoConvertor",
+                    "preferedformat": "mp4",
+                }
+            )
         elif self.settings.output_format == "MKV":
             opts["format"] = "bv*+ba/b"
             opts["merge_output_format"] = "mkv"
@@ -373,16 +397,14 @@ class DownloadWorker(QObject):
         else:
             opts["format"] = "bv*+ba/b"
 
-        # Subtitle download and embed options
         if allow_subtitles:
             if self.settings.write_subs:
                 opts["writesubtitles"] = True
-                opts["writeautomaticsub"] = True # Automatically write auto-generated subtitles
-                opts["subtitleslangs"] = ["all"] # Download all available subtitles
+                opts["writeautomaticsub"] = True 
+                opts["subtitleslangs"] = ["all"] 
 
             if self.settings.embed_subs_checkbox:
                 opts["embedsubtitles"] = True
-                # Ensure subtitles are written to disk before embedding, if not already set by write_subs
                 if not self.settings.write_subs:
                     opts["writesubtitles"] = True
                     opts["writeautomaticsub"] = True
@@ -459,7 +481,7 @@ class DownloadWorker(QObject):
         elif state == "finished":
             total_bytes = status.get("total_bytes") or status.get("downloaded_bytes")
             done_size = self.format_bytes(total_bytes)
-            self.signals.progress.emit(self.task.task_id, 100, done_size, f"{done_size} | Đang xử lý hậu kỳ...")
+            self.signals.progress.emit(self.task.task_id, 100, done_size, f"{done_size} | Đang xử lý hậu kỳ / Chuyển định dạng...")
 
     def run(self):
         retry_delays = [8, 20, 45]
@@ -683,7 +705,6 @@ class EmbeddedLoginDialog(QDialog):
         self.cookie_store = QWebEngineProfile.defaultProfile().cookieStore()
         self.cookie_store.cookieAdded.connect(self.on_cookie_added)
         self.cookie_store.cookieRemoved.connect(self.on_cookie_removed)
-        # Request all cookies so existing authenticated sessions are visible.
         self.cookie_store.loadAllCookies()
 
     def on_url_changed(self, url: QUrl):
@@ -778,16 +799,12 @@ class EmbeddedLoginDialog(QDialog):
             if any(saved_domain.endswith(domain) for domain in allowed_domains):
                 platform_cookie_count += 1
 
-        # Wait until multiple platform cookies exist to reduce false positives.
         if platform_cookie_count < 3:
             return
 
-        # Keep the dialog open for a short grace period to avoid instant close
-        # when pre-existing cookies are restored by the browser profile.
         if time.monotonic() - self.opened_at < 4.0:
             return
 
-        # Only auto-close after user has navigated away from login/signin routes.
         current = (self.current_url or "").lower()
         if any(token in current for token in ("/login", "signin", "log-in", "accounts.google.com/signin")):
             return
@@ -912,7 +929,7 @@ class SettingsDialog(QDialog):
 
         format_label = QLabel("Định dạng đầu ra")
         self.format_combo = QComboBox()
-        self.format_combo.addItems(["MP4", "MKV", "MP3", "FLAC"])
+        self.format_combo.addItems(["MP4", "MP4 (Convert)", "MKV", "MP3", "FLAC"])
         self.format_combo.setCurrentText(current.output_format)
 
         self.write_subs = QCheckBox("Tải xuống phụ đề")
@@ -960,8 +977,6 @@ class SettingsDialog(QDialog):
         layout.addWidget(actions)
 
         if not WEBENGINE_AVAILABLE:
-            # Always enable the button, but show a message if WebEngine is missing
-            # self.login_button.setEnabled(False)
             self.cookie_status.setText("Qt WebEngine chưa sẵn sàng. Cài: pip install PyQt6-WebEngine")
 
     def update_cookie_status(self):
@@ -1005,6 +1020,29 @@ class SettingsDialog(QDialog):
         )
 
 
+class UpdateThread(QThread):
+    update_finished = pyqtSignal(bool, str)
+
+    def run(self):
+        command = [sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp"]
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            output = (result.stdout or result.stderr or "").strip()
+            if result.returncode == 0:
+                message = output or "yt-dlp da duoc cap nhat thanh cong."
+                self.update_finished.emit(True, message)
+            else:
+                message = output or f"pip ket thuc voi ma loi {result.returncode}."
+                self.update_finished.emit(False, message)
+        except Exception as exc:
+            self.update_finished.emit(False, f"Loi khi cap nhat yt-dlp: {exc}")
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1020,6 +1058,7 @@ class MainWindow(QMainWindow):
         self.queue_widgets: dict[str, QueueItemWidget] = {}
         self.force_stop_timers: dict[str, QTimer] = {}
         self.sidebar_buttons: list[QPushButton] = []
+        self.update_thread: UpdateThread | None = None
 
         self.setWindowTitle("yt-dlp Queue Downloader")
         self.resize(1280, 780)
@@ -1031,27 +1070,44 @@ class MainWindow(QMainWindow):
         if FFMPEG_PATH:
             self.append_log("success", f"[system] ffmpeg: {FFMPEG_PATH}")
         else:
-            self.append_log("warning", "[hệ thống] Không tìm thấy ffmpeg. Các chế độ cần xử lý media có thể thất bại.")
+            self.append_log("warning", "[hệ thống] Không tìm thấy ffmpeg. Các chế độ chuyển định dạng video/audio sẽ thất bại.")
 
         if WEBENGINE_AVAILABLE:
             self.append_log("info", "[hệ thống] Qt WebEngine sẵn sàng cho đăng nhập nhúng.")
         else:
             self.append_log("warning", "[hệ thống] Chưa có Qt WebEngine. Cài PyQt6-WebEngine để dùng đăng nhập nhúng.")
         self.append_log("info", f"[hệ thống] Phiên bản ứng dụng: v{self.current_version}")
-        if self.current_version != VERSION:
-            self.append_log(
-                "warning",
-                f"[hệ thống] app_config CURRENT_VERSION (v{self.current_version}) khác VERSION mã nguồn (v{VERSION}).",
-            )
         self.append_log("info", f"[hệ thống] Thư mục lưu mặc định: {self.settings.output_dir}")
         self.update_cookie_status()
         QTimer.singleShot(1500, self.check_for_updates_silent)
+        self.check_core_update()
 
     def get_default_download_dir(self) -> str:
         default_dir = os.path.join(os.path.expanduser("~"), "Downloads")
         if os.path.isdir(default_dir):
             return default_dir
         return str(DOWNLOAD_DIR)
+
+    def check_core_update(self):
+        if self.update_thread and self.update_thread.isRunning():
+            return
+        self.append_log("info", "[system] Dang kiem tra va nang cap yt-dlp trong nen...")
+        self.update_thread = UpdateThread()
+        self.update_thread.update_finished.connect(self.on_update_completed)
+        self.update_thread.finished.connect(self._clear_update_thread)
+        self.update_thread.finished.connect(self.update_thread.deleteLater)
+        self.update_thread.start()
+
+    def on_update_completed(self, success, message):
+        level = "success" if success else "warning"
+        prefix = "[system] Cap nhat yt-dlp hoan tat" if success else "[system] Cap nhat yt-dlp that bai"
+        if hasattr(self, "append_log"):
+            self.append_log(level, f"{prefix}: {message}")
+        else:
+            print(f"{prefix}: {message}")
+
+    def _clear_update_thread(self):
+        self.update_thread = None
 
     def _build_ui(self):
         root = QWidget()
@@ -1192,7 +1248,7 @@ class MainWindow(QMainWindow):
         format_label = QLabel("Định dạng")
         format_label.setObjectName("Hint")
         self.format_combo = QComboBox()
-        self.format_combo.addItems(["MP4", "MKV", "MP3", "FLAC"])
+        self.format_combo.addItems(["MP4", "MP4 (Convert)", "MKV", "MP3", "FLAC"])
         self.format_combo.setCurrentText(self.settings.output_format)
         row1.addWidget(format_label)
         row1.addWidget(self.format_combo, 1)
@@ -1221,7 +1277,6 @@ class MainWindow(QMainWindow):
         self.cookie_status.setObjectName("Hint")
         self.cookie_status.setWordWrap(True)
 
-        # These are instance variables of MainWindow, not local to _build_settings_page
         self.write_subs_checkbox = QCheckBox("Tải xuống phụ đề")
         self.write_subs_checkbox.setChecked(self.settings.write_subs)
 
@@ -1254,11 +1309,6 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.cookie_status)
         layout.addStretch(1)
 
-        if not WEBENGINE_AVAILABLE:
-            # Always enable the button, but show a message if WebEngine is missing
-            # self.sidebar_login_button.setEnabled(False)
-            pass  # The message is now handled in open_login_dialog
-
         return page
 
     def _build_logs_page(self) -> QWidget:
@@ -1288,68 +1338,77 @@ class MainWindow(QMainWindow):
         self.help_text.setHtml(
             f"""
             <div>
-                <h2 style='font-size:18px; color:#58a6ff; margin:0 0 14px 0;'>SỔ TAY SỬ DỤNG DLPMaster</h2>
+                <h2 style='font-size:18px; color:#58a6ff; margin:0 0 14px 0;'>HƯỚNG DẪN SỬ DỤNG DLP-Master</h2>
 
-                <h3 style='font-size:14px; color:#eac54f; margin:14px 0 8px 0; font-weight:700;'>1) 🛠️ KHỞI ĐỘNG VÀ CHỌN THƯ MỤC LƯU</h3>
+                <h3 style='font-size:14px; color:#eac54f; margin:14px 0 8px 0; font-weight:700;'>1) TỔNG QUAN GIAO DIỆN</h3>
                 <ul style='color:#c9d1d9; line-height:1.7; margin:0 0 8px 18px;'>
-                    <li>Mở app, vào tab <b>Cấu hình &amp; Cookie</b>.</li>
-                    <li>Chọn <b>Thư mục lưu</b> theo nhu cầu (ổ D, Desktop, thư mục riêng...).</li>
-                    <li>Chọn định dạng xuất: <b>MP4 / MKV / MP3 / FLAC</b>.</li>
+                    <li><b>Tiến trình tải</b>: dán link, bắt đầu tải, theo dõi tiến độ và trạng thái từng video.</li>
+                    <li><b>Cấu hình &amp; Cookie</b>: chọn định dạng xuất, phụ đề, thumbnail, SponsorBlock, thư mục lưu và kiểm tra cập nhật ứng dụng.</li>
+                    <li><b>Nhật ký hệ thống</b>: xem log chi tiết của yt-dlp, ffmpeg, cookie, cập nhật và lỗi phát sinh.</li>
+                    <li><b>Hướng dẫn sử dụng</b>: xem quy trình thao tác và cách xử lý lỗi thường gặp.</li>
                 </ul>
 
-                <h3 style='font-size:14px; color:#eac54f; margin:14px 0 8px 0; font-weight:700;'>2) 📥 TẢI VIDEO ĐƠN</h3>
+                <h3 style='font-size:14px; color:#eac54f; margin:14px 0 8px 0; font-weight:700;'>2) THIẾT LẬP TRƯỚC KHI TẢI</h3>
                 <ul style='color:#c9d1d9; line-height:1.7; margin:0 0 8px 18px;'>
-                    <li>Vào tab <b>Tiến trình tải</b>, dán URL và bấm <b>BẮT ĐẦU TẢI</b>.</li>
-                    <li>Theo dõi tiến độ ngay trong <b>Hàng đợi tải</b>.</li>
+                    <li>Vào <b>Cấu hình &amp; Cookie</b>, chọn <b>Định dạng</b>: MP4, MP4 (Convert), MKV, MP3 hoặc FLAC.</li>
+                    <li>Bấm <b>Thay đổi...</b> để chọn thư mục lưu. Mặc định là thư mục Downloads của Windows nếu có.</li>
+                    <li>Bật <b>Tải xuống phụ đề</b> nếu muốn lưu phụ đề riêng; bật <b>Nhúng phụ đề vào video</b> nếu muốn gắn phụ đề vào file video.</li>
+                    <li>Bật <b>Nhúng thumbnail vào file</b> để gắn ảnh bìa, hoặc <b>Cắt quảng cáo với SponsorBlock</b> nếu nguồn hỗ trợ.</li>
                 </ul>
 
-                <h3 style='font-size:14px; color:#eac54f; margin:14px 0 8px 0; font-weight:700;'>3) 🚚 TẢI NHIỀU LINK / KÊNH / PLAYLIST</h3>
+                <h3 style='font-size:14px; color:#eac54f; margin:14px 0 8px 0; font-weight:700;'>3) TẢI VIDEO, PLAYLIST HOẶC NHIỀU LINK</h3>
                 <ul style='color:#c9d1d9; line-height:1.7; margin:0 0 8px 18px;'>
-                    <li>Dán nhiều link, mỗi dòng một URL.</li>
-                    <li>App dùng hàng đợi và chế độ <b>vừa quét vừa tải (lazy playlist)</b>.</li>
-                    <li>Nếu cần dừng khẩn cấp, bấm <b>Dừng tất cả</b>.</li>
+                    <li>Vào <b>Tiến trình tải</b>, dán một URL hoặc nhiều URL, mỗi link một dòng.</li>
+                    <li>Bấm <b>BẮT ĐẦU TẢI</b>. Mỗi link sẽ được thêm vào <b>Hàng đợi tải</b> với mã task riêng.</li>
+                    <li>Ứng dụng tải tối đa <b>{MAX_CONCURRENT_DOWNLOADS} task cùng lúc</b>; các link còn lại tự động chờ đến lượt.</li>
+                    <li>Với playlist/kênh, app dùng chế độ <b>lazy playlist</b> để vừa đọc danh sách vừa tải, giúp tránh đứng giao diện quá lâu.</li>
+                    <li>Thanh tiến độ hiển thị phần trăm, dung lượng và trạng thái: đang chờ, đang tải, hoàn tất, thất bại hoặc đã dừng.</li>
                 </ul>
 
-                <h3 style='font-size:14px; color:#eac54f; margin:14px 0 8px 0; font-weight:700;'>4) 🔐 ĐĂNG NHẬP COOKIE NHÚNG</h3>
+                <h3 style='font-size:14px; color:#eac54f; margin:14px 0 8px 0; font-weight:700;'>4) ĐIỀU KHIỂN HÀNG ĐỢI</h3>
                 <ul style='color:#c9d1d9; line-height:1.7; margin:0 0 8px 18px;'>
-                    <li>Vào tab <b>Cấu hình &amp; Cookie</b>, bấm nút đăng nhập.</li>
-                    <li>Chọn nền tảng (TikTok/YouTube/Facebook), đăng nhập trong cửa sổ nhúng.</li>
-                    <li>Sau khi đăng nhập xong, đóng cửa sổ để app tự lưu cookie tạm.</li>
+                    <li><b>Dừng tất cả</b>: hủy các task đang chờ và gửi lệnh dừng đến các task đang tải.</li>
+                    <li><b>Xóa danh sách</b>: chỉ xóa các mục đã hoàn tất, thất bại hoặc đã dừng; task đang tải sẽ được giữ lại.</li>
+                    <li>Nếu task bị lỗi, xem thông tin ngắn ngay trên item và xem chi tiết trong <b>Nhật ký hệ thống</b>.</li>
                 </ul>
 
                 <div style='border:1px solid #2f3f57; border-radius:10px; background:#121c2c; padding:12px 14px; margin:12px 0;'>
-                    <div style='color:#58a6ff; font-weight:700; margin-bottom:6px;'>Lưu ý quan trọng về 429</div>
+                    <div style='color:#58a6ff; font-weight:700; margin-bottom:6px;'>Lưu ý về ffmpeg</div>
                     <div style='color:#c9d1d9; line-height:1.7;'>
-                        Khi gặp <b>HTTP 429 (Too Many Requests)</b>, hãy chờ một lúc rồi thử lại. Bạn cũng nên dùng cookie đăng nhập để tăng độ ổn định.
+                        Các chế độ MP4, MP4 (Convert), MKV, MP3, FLAC, nhúng phụ đề, nhúng thumbnail và SponsorBlock cần ffmpeg.
+                        Nếu ứng dụng báo thiếu ffmpeg, hãy cài ffmpeg vào PATH hoặc đặt trong thư mục tools/ffmpeg/bin của app.
                     </div>
                 </div>
 
-                <h3 style='font-size:14px; color:#eac54f; margin:14px 0 8px 0; font-weight:700;'>5) 🧩 TÙY CHỌN NÂNG CAO</h3>
+                <h3 style='font-size:14px; color:#eac54f; margin:14px 0 8px 0; font-weight:700;'>5) ĐĂNG NHẬP COOKIE CHO VIDEO GIỚI HẠN</h3>
                 <ul style='color:#c9d1d9; line-height:1.7; margin:0 0 8px 18px;'>
-                    <li><b>Tự động nhúng phụ đề</b>: có fallback khi phụ đề bị 429.</li>
-                    <li><b>Nhúng thumbnail</b>: thêm ảnh bìa vào file xuất.</li>
-                    <li><b>SponsorBlock</b>: cắt đoạn quảng cáo nếu nguồn hỗ trợ.</li>
+                    <li>Bấm <b>Đăng nhập tài khoản</b> ở thanh bên trái để mở cửa sổ đăng nhập nhúng.</li>
+                    <li>Chọn nền tảng: TikTok, YouTube, Facebook, Douyin hoặc Kuaishou, rồi đăng nhập trong trình duyệt nhúng.</li>
+                    <li>Sau khi đăng nhập thành công, bấm <b>Tôi đã đăng nhập xong - Lưu cookie</b> hoặc đóng cửa sổ để app lưu cookie tạm.</li>
+                    <li>Cookie đang sử dụng sẽ hiện trong tab <b>Cấu hình &amp; Cookie</b>. Cookie tạm được dọn dẹp khi đóng ứng dụng.</li>
                 </ul>
 
-                <h3 style='font-size:14px; color:#eac54f; margin:14px 0 8px 0; font-weight:700;'>6) 🧭 ĐỌC TRẠNG THÁI HÀNG ĐỢI</h3>
+                <h3 style='font-size:14px; color:#eac54f; margin:14px 0 8px 0; font-weight:700;'>6) CẬP NHẬT VÀ NHẬT KÝ</h3>
                 <ul style='color:#c9d1d9; line-height:1.7; margin:0 0 8px 18px;'>
-                    <li><b>Đang chờ</b>: chưa đến lượt.</li>
-                    <li><b>Đang tải</b>: đang xử lý.</li>
-                    <li><b>Hoàn tất</b>: tải thành công.</li>
-                    <li><b>Đã dừng</b>: dừng bởi người dùng.</li>
-                    <li><b>Thất bại</b>: gặp lỗi cần thử lại.</li>
+                    <li>Khi mở app, DLP-Master tự chạy nền lệnh nâng cấp lõi <b>yt-dlp</b>; kết quả sẽ hiện trong log.</li>
+                    <li>Nút <b>Kiểm tra cập nhật</b> dùng để kiểm tra phiên bản ứng dụng nếu đã cấu hình UPDATE_URL trong app_config.py.</li>
+                    <li>Tab <b>Nhật ký hệ thống</b> hiển thị log tải, lỗi 429, lỗi cookie, ffmpeg, cập nhật yt-dlp và cập nhật ứng dụng.</li>
+                    <li>Bấm <b>Xóa log</b> để làm sạch màn hình log, không ảnh hưởng đến task đang tải.</li>
                 </ul>
 
-                <h3 style='font-size:14px; color:#eac54f; margin:14px 0 8px 0; font-weight:700;'>7) 🧹 DỌN DẸP SAU KHI TẢI</h3>
+                <h3 style='font-size:14px; color:#eac54f; margin:14px 0 8px 0; font-weight:700;'>7) XỬ LÝ LỖI THƯỜNG GẶP</h3>
                 <ul style='color:#c9d1d9; line-height:1.7; margin:0 0 8px 18px;'>
-                    <li>Bấm <b>Xóa danh sách</b> để dọn các mục đã xong/lỗi/đã dừng.</li>
-                    <li>Vào tab <b>Nhật ký hệ thống</b> để xem log kỹ thuật chi tiết.</li>
+                    <li><b>Thiếu URL</b>: dán link vào ô nhập, mỗi link một dòng nếu tải nhiều video.</li>
+                    <li><b>Thiếu ffmpeg</b>: cài ffmpeg hoặc chọn lại cấu hình không cần xử lý media nếu phù hợp.</li>
+                    <li><b>HTTP 429 / Too Many Requests</b>: tạm dừng một lúc rồi thử lại; đăng nhập cookie thường giúp ổn định hơn.</li>
+                    <li><b>Video giới hạn hoặc yêu cầu đăng nhập</b>: dùng nút <b>Đăng nhập tài khoản</b> để lấy cookie trước khi tải.</li>
+                    <li><b>Tên file quá dài/ký tự lạ</b>: app đã giới hạn tiêu đề và bật chế độ tên file thân thiện với Windows.</li>
                 </ul>
 
                 <div style='border:1px solid #2f3f57; border-radius:10px; background:#101926; padding:12px 14px; margin:12px 0;'>
                     <div style='color:#58a6ff; font-weight:700; margin-bottom:6px;'>Quy trình khuyến nghị</div>
                     <div style='color:#c9d1d9; line-height:1.7;'>
-                        Chọn thư mục lưu → Chọn định dạng → (Tùy chọn) Đăng nhập cookie → Dán URL → Bắt đầu tải → Theo dõi hàng đợi.
+                        Chọn thư mục lưu -> chọn định dạng -> đăng nhập cookie nếu cần -> dán URL -> BẮT ĐẦU TẢI -> theo dõi hàng đợi và log.
                     </div>
                 </div>
 
@@ -1426,11 +1485,6 @@ class MainWindow(QMainWindow):
                 border-color: #4b86c2;
                 color: #e8f5ff;
             }
-            QPushButton#SidebarActionButton:disabled {
-                background: #0f1724;
-                color: #59728f;
-                border-color: #223249;
-            }
             QStackedWidget#ContentStack {
                 background: transparent;
             }
@@ -1490,14 +1544,6 @@ class MainWindow(QMainWindow):
                 border-radius: 8px;
                 padding: 8px 12px;
             }
-            QPushButton#SettingsButton:hover, QPushButton#ClearButton:hover, QPushButton#LoginButton:hover, QPushButton#QueueActionButton:hover, QPushButton:hover {
-                border-color: #58b7ff;
-                color: #d9efff;
-            }
-            QPushButton#QueueDangerButton:hover {
-                border-color: #d96a6a;
-                color: #ffe1e1;
-            }
             QScrollArea#QueueScroll {
                 border: 0;
                 background: transparent;
@@ -1540,10 +1586,6 @@ class MainWindow(QMainWindow):
                 background: #122034;
                 border: 1px solid #2d4a6d;
             }
-            QLabel#QueueMeta {
-                color: #8ea6c2;
-                font-size: 12px;
-            }
             QProgressBar {
                 border: 1px solid #30435d;
                 border-radius: 6px;
@@ -1565,16 +1607,6 @@ class MainWindow(QMainWindow):
                 font-family: Consolas, "Cascadia Mono", monospace;
                 font-size: 12px;
             }
-            QTextBrowser#HelpBrowser {
-                background: #0b121d;
-                color: #dbe4ee;
-                border: 1px solid #253448;
-                border-radius: 10px;
-                padding: 20px;
-                font-family: "Segoe UI", "Noto Sans", sans-serif;
-                font-size: 13px;
-                line-height: 1.4;
-            }
             QCheckBox::indicator {
                 width: 18px;
                 height: 18px;
@@ -1582,19 +1614,9 @@ class MainWindow(QMainWindow):
                 border-radius: 4px;
                 background: #161b22;
             }
-
-            QCheckBox::indicator:hover {
-                border: 1px solid #58a6ff;
-            }
-
             QCheckBox::indicator:checked {
                 background: #18FFFF;
                 border: 2px solid #58a6ff;
-                border-radius: 4px;
-            }
-            QLabel#Hint {
-                color: #8ea6c2;
-                font-size: 12px;
             }
             """
         )
@@ -1637,7 +1659,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(
                 self,
                 "Thiếu ffmpeg",
-                "Cài đặt hiện tại cần ffmpeg. Hãy cài ffmpeg vào PATH hoặc đổi cấu hình trong Cài đặt.",
+                "Cài đặt hiện tại cần ffmpeg để convert/xử lý. Hãy cài ffmpeg vào máy tính hoặc đổi cấu hình định dạng khác.",
             )
             return
 
@@ -1659,7 +1681,7 @@ class MainWindow(QMainWindow):
 
     def settings_requires_ffmpeg(self) -> bool:
         return (
-            self.settings.output_format in {"MP4", "MKV", "MP3", "FLAC"}
+            self.settings.output_format in {"MP4", "MP4 (Convert)", "MKV", "MP3", "FLAC"}
             or self.settings.write_subs
             or self.settings.embed_subs_checkbox
             or self.settings.embed_thumbnail
@@ -1688,6 +1710,8 @@ class MainWindow(QMainWindow):
         thread.started.connect(worker.run)
         worker.signals.finished.connect(thread.quit)
         worker.signals.finished.connect(worker.deleteLater)
+        
+        # CHỈ GỌI hàm dọn dẹp dữ liệu KHI thread phát tín hiệu đã ngắt hoàn toàn
         thread.finished.connect(lambda task_id=task.task_id: self.handle_thread_finished(task_id))
         thread.finished.connect(thread.deleteLater)
 
@@ -1761,27 +1785,14 @@ class MainWindow(QMainWindow):
     def check_for_updates(self, manual: bool = False):
         if not self.update_url:
             self.append_log("warning", "[update] Chưa cấu hình UPDATE_URL trong app_config.py")
-            if manual:
-                QMessageBox.information(self, "Cập nhật", "Chưa cấu hình UPDATE_URL để kiểm tra phiên bản.")
             return
-
         try:
             release = self.fetch_release_info()
-        except urllib.error.URLError as err:
-            self.append_log("warning", f"[update] Không thể kiểm tra cập nhật: {clean_log_text(err)}")
-            if manual:
-                QMessageBox.warning(self, "Cập nhật", f"Không thể kiểm tra cập nhật:\n{clean_log_text(err)}")
-            return
         except Exception as err:
-            self.append_log("error", f"[update] Lỗi kiểm tra cập nhật: {clean_log_text(err)}")
-            if manual:
-                QMessageBox.critical(self, "Cập nhật", f"Lỗi kiểm tra cập nhật:\n{clean_log_text(err)}")
+            self.append_log("warning", f"[update] Không thể kiểm tra cập nhật: {clean_log_text(err)}")
             return
 
         if not release:
-            self.append_log("warning", "[update] UPDATE_URL phản hồi rỗng hoặc sai định dạng.")
-            if manual:
-                QMessageBox.warning(self, "Cập nhật", "Không đọc được dữ liệu phiên bản từ UPDATE_URL.")
             return
 
         if release.download_url:
@@ -1789,72 +1800,28 @@ class MainWindow(QMainWindow):
 
         remote_version = (release.version or "").strip().lstrip("vV")
         if remote_version and is_remote_version_newer(remote_version, self.current_version):
-            self.append_log(
-                "warning",
-                f"[update] Có phiên bản mới v{remote_version} (hiện tại v{self.current_version}).",
-            )
-            if release.download_url:
-                ask = QMessageBox.question(
-                    self,
-                    "Có bản cập nhật mới",
-                    (
-                        f"Đã có phiên bản mới v{remote_version}.\n"
-                        f"Phiên bản hiện tại: v{self.current_version}.\n\n"
-                        "Bạn có muốn mở trang tải bản mới không?"
-                    ),
-                )
+            self.append_log("warning", f"[update] Có phiên bản mới v{remote_version} (hiện tại v{self.current_version}).")
+            if release.download_url and manual:
+                ask = QMessageBox.question(self, "Có bản cập nhật mới", f"Đã có phiên bản mới v{remote_version}. Mở trang tải?")
                 if ask == QMessageBox.StandardButton.Yes:
                     webbrowser.open(release.download_url)
-            elif manual:
-                QMessageBox.information(
-                    self,
-                    "Có bản cập nhật mới",
-                    f"Đã có phiên bản mới v{remote_version}, nhưng chưa có link tải trong version.json.",
-                )
-            return
-
-        if not remote_version and release.download_url:
-            self.append_log("info", "[update] Đã nhận link phát hành, nhưng thiếu trường version để so sánh.")
-            if manual:
-                ask = QMessageBox.question(
-                    self,
-                    "Thông tin cập nhật",
-                    "Đã nhận link phát hành nhưng thiếu số phiên bản. Mở trang phát hành ngay?",
-                )
-                if ask == QMessageBox.StandardButton.Yes:
-                    webbrowser.open(release.download_url)
-            return
-
-        self.append_log("info", f"[update] Đang ở phiên bản mới nhất (v{self.current_version}).")
-        if manual:
-            QMessageBox.information(self, "Cập nhật", f"Bạn đang ở phiên bản mới nhất: v{self.current_version}")
 
     def open_login_dialog(self):
         if not WEBENGINE_AVAILABLE:
-            # QMessageBox.warning(self, "Thiếu WebEngine", "Cài đặt thêm: pip install PyQt6-WebEngine")
             self.append_log("warning", "[đăng nhập] Qt WebEngine chưa sẵn sàng. Cài đặt thêm: pip install PyQt6-WebEngine")
             return
 
         old_cookie = self.settings.cookie_file
-
         try:
             dialog = EmbeddedLoginDialog(self)
             dialog.setStyleSheet(self.styleSheet())
             dialog.exec()
         except Exception as err:
             QMessageBox.critical(self, "Lỗi đăng nhập", f"Không thể mở cửa sổ đăng nhập:\n{err}")
-            self.append_log("error", f"[đăng nhập] Không thể mở cửa sổ đăng nhập: {clean_log_text(err)}")
             return
 
         new_cookie_file = dialog.cookie_file_path
         if new_cookie_file and Path(new_cookie_file).exists():
-            if not dialog.auth_verified:
-                QMessageBox.warning(
-                    self,
-                    "Cookie chưa đủ",
-                    "Đã lưu cookie nhưng chưa xác nhận được trạng thái đăng nhập. Hãy mở lại và bấm 'Tôi đã đăng nhập xong - Lưu cookie' sau khi đăng nhập hoàn tất.",
-                )
-                self.append_log("warning", "[đăng nhập] Cookie đã lưu nhưng chưa xác minh được đăng nhập")
             self.settings.cookie_file = new_cookie_file
             if old_cookie and Path(old_cookie).exists() and old_cookie != new_cookie_file:
                 try:
@@ -1863,29 +1830,17 @@ class MainWindow(QMainWindow):
                     pass
             self.update_cookie_status()
             self.append_log("info", "[cài đặt] Đăng nhập nhúng thành công, đã cập nhật cookie tạm")
-        elif not new_cookie_file:
-            QMessageBox.information(self, "Cookie", "Chưa thu được cookie nào. Hãy đăng nhập rồi đóng cửa sổ trình duyệt.")
-            self.append_log("warning", "[đăng nhập] Chưa thu được cookie sau khi đóng cửa sổ")
 
     def choose_download_directory(self):
         current_dir = self.download_dir_input.text().strip() or self.get_default_download_dir()
-        selected_dir = QFileDialog.getExistingDirectory(
-            self,
-            "Chọn thư mục lưu video/audio",
-            current_dir,
-        )
+        selected_dir = QFileDialog.getExistingDirectory(self, "Chọn thư mục lưu video/audio", current_dir)
         if selected_dir:
             self.download_dir_input.setText(selected_dir)
             self.settings.output_dir = selected_dir
             self.append_log("info", f"[cài đặt] Thư mục lưu mới: {selected_dir}")
 
     def append_log(self, level: str, message: str):
-        colors = {
-            "success": "#7cf2bf",
-            "warning": "#ffd166",
-            "error": "#ff7f7f",
-            "info": "#dbe4ee",
-        }
+        colors = {"success": "#7cf2bf", "warning": "#ffd166", "error": "#ff7f7f", "info": "#dbe4ee"}
         fmt = QTextCharFormat()
         fmt.setForeground(QColor(colors.get(level, "#dbe4ee")))
         cursor = self.console.textCursor()
@@ -1910,26 +1865,17 @@ class MainWindow(QMainWindow):
             item.deleteLater()
             del self.queue_widgets[task_id]
             removed += 1
-
         if removed:
-            self.append_log("info", f"[hàng đợi] Đã xóa {removed} item đã tải xong")
-        else:
-            self.append_log("info", "[hàng đợi] Không có item nào để xóa")
+            self.append_log("info", f"[hàng đợi] Đã xóa {removed} item")
 
     def stop_all_tasks(self):
-        pending_cleared = len(self.pending_queue)
         self.pending_queue.clear()
-
         for task_id, item in self.queue_widgets.items():
             if task_id not in self.active_threads and item.status.property("state") == "queued":
                 item.mark_cancelled()
-                item.meta.setText("Đã hủy trước khi bắt đầu")
 
-        active_count = len(self.active_threads)
         for task_id, (thread, worker) in list(self.active_threads.items()):
             worker.stop()
-            self.append_log("warning", f"[hàng đợi] Gửi yêu cầu dừng task {task_id}")
-
             if task_id not in self.force_stop_timers:
                 timer = QTimer(self)
                 timer.setSingleShot(True)
@@ -1937,36 +1883,20 @@ class MainWindow(QMainWindow):
                 timer.start(3000)
                 self.force_stop_timers[task_id] = timer
 
-        self.append_log(
-            "warning",
-            f"[hàng đợi] Dừng tất cả: đã hủy {pending_cleared} task chờ, đang dừng {active_count} task đang chạy.",
-        )
-
     def force_terminate_task(self, task_id: str):
         pair = self.active_threads.get(task_id)
         if not pair:
             return
-
         thread, worker = pair
         if not thread.isRunning():
             return
-
-        self.append_log("warning", f"[hàng đợi] Task {task_id} không dừng kịp, buộc terminate thread")
-        try:
-            worker.stop()
-            worker.emit_cancelled_once()
-        except Exception:
-            pass
+        worker.emit_cancelled_once()
         thread.terminate()
         thread.wait(1000)
 
     def closeEvent(self, event):
         if self.active_threads:
-            QMessageBox.information(
-                self,
-                "Đang tải",
-                "Vẫn còn task đang tải. Hãy đợi hoàn tất trước khi đóng ứng dụng để tránh lỗi thread.",
-            )
+            QMessageBox.information(self, "Đang tải", "Hãy đợi hoàn tất hoặc dừng các task trước khi đóng ứng dụng.")
             event.ignore()
             return
 
@@ -1975,7 +1905,6 @@ class MainWindow(QMainWindow):
                 Path(self.settings.cookie_file).unlink()
             except OSError:
                 pass
-
         event.accept()
 
 
