@@ -24,7 +24,7 @@ from yt_dlp.utils import DownloadError
 QT_BINDING = ""
 
 try:
-    from PyQt6.QtCore import QObject, QThread, QTimer, QUrl, pyqtSignal
+    from PyQt6.QtCore import QObject, QLockFile, QThread, QTimer, QUrl, pyqtSignal
     from PyQt6.QtGui import QColor, QTextCharFormat, QTextCursor
     from PyQt6.QtWidgets import (
         QApplication,
@@ -52,7 +52,7 @@ try:
     QT_BINDING = "PyQt6"
 except ImportError:
     try:
-        from PySide6.QtCore import QObject, QThread, QTimer, QUrl, Signal as pyqtSignal
+        from PySide6.QtCore import QObject, QLockFile, QThread, QTimer, QUrl, Signal as pyqtSignal
         from PySide6.QtGui import QColor, QTextCharFormat, QTextCursor
         from PySide6.QtWidgets import (
             QApplication,
@@ -161,6 +161,7 @@ def detect_ffmpeg_bin() -> tuple[str | None, str | None]:
 
 
 FFMPEG_PATH, FFMPEG_BIN = detect_ffmpeg_bin()
+APP_INSTANCE_LOCK = None
 
 
 @dataclass
@@ -1048,6 +1049,8 @@ class MainWindow(QMainWindow):
         super().__init__()
         DOWNLOAD_DIR.mkdir(exist_ok=True)
 
+        self.is_frozen_build = bool(getattr(sys, "frozen", False))
+
         self.current_version = (str(CONFIG_CURRENT_VERSION).strip() or VERSION).lstrip("vV")
         self.update_url = str(UPDATE_URL).strip()
         self.latest_release_url = ""
@@ -1080,7 +1083,10 @@ class MainWindow(QMainWindow):
         self.append_log("info", f"[hệ thống] Thư mục lưu mặc định: {self.settings.output_dir}")
         self.update_cookie_status()
         QTimer.singleShot(1500, self.check_for_updates_silent)
-        self.check_core_update()
+        if self.is_frozen_build:
+            self.append_log("info", "[system] Bo qua auto-cap nhat yt-dlp bang pip trong ban dong goi (.exe).")
+        else:
+            self.check_core_update()
 
     def get_default_download_dir(self) -> str:
         default_dir = os.path.join(os.path.expanduser("~"), "Downloads")
@@ -1089,6 +1095,8 @@ class MainWindow(QMainWindow):
         return str(DOWNLOAD_DIR)
 
     def check_core_update(self):
+        if self.is_frozen_build:
+            return
         if self.update_thread and self.update_thread.isRunning():
             return
         self.append_log("info", "[system] Dang kiem tra va nang cap yt-dlp trong nen...")
@@ -1911,12 +1919,24 @@ class MainWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+
+    global APP_INSTANCE_LOCK
+    lock_path = os.path.join(tempfile.gettempdir(), "dlp_master_qt.lock")
+    APP_INSTANCE_LOCK = QLockFile(lock_path)
+    APP_INSTANCE_LOCK.setStaleLockTime(0)
+    if not APP_INSTANCE_LOCK.tryLock(100):
+        QMessageBox.information(None, "Da mo san", "DLP Master dang chay o cua so khac.")
+        return
+
     window = MainWindow()
     window.show()
     try:
         exit_code = app.exec()
     except KeyboardInterrupt:
         exit_code = 0
+    finally:
+        if APP_INSTANCE_LOCK and APP_INSTANCE_LOCK.isLocked():
+            APP_INSTANCE_LOCK.unlock()
     sys.exit(exit_code)
 
 
