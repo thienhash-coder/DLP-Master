@@ -12,6 +12,7 @@ import time
 import traceback
 import uuid
 import urllib.error
+import urllib.parse
 import urllib.request
 import webbrowser
 from collections import deque
@@ -1062,6 +1063,7 @@ class MainWindow(QMainWindow):
         self.force_stop_timers: dict[str, QTimer] = {}
         self.sidebar_buttons: list[QPushButton] = []
         self.update_thread: UpdateThread | None = None
+        self.update_prompted_version = ""
 
         self.setWindowTitle("yt-dlp Queue Downloader")
         self.resize(1280, 780)
@@ -1809,10 +1811,101 @@ class MainWindow(QMainWindow):
         remote_version = (release.version or "").strip().lstrip("vV")
         if remote_version and is_remote_version_newer(remote_version, self.current_version):
             self.append_log("warning", f"[update] Có phiên bản mới v{remote_version} (hiện tại v{self.current_version}).")
-            if release.download_url and manual:
-                ask = QMessageBox.question(self, "Có bản cập nhật mới", f"Đã có phiên bản mới v{remote_version}. Mở trang tải?")
-                if ask == QMessageBox.StandardButton.Yes:
-                    webbrowser.open(release.download_url)
+            if not manual and self.update_prompted_version == remote_version:
+                return
+            if self.prompt_update_actions(remote_version, release.download_url):
+                self.update_prompted_version = remote_version
+
+    def prompt_update_actions(self, remote_version: str, download_url: str) -> bool:
+        if not download_url:
+            self.append_log("warning", "[update] Có bản mới nhưng chưa có download_url.")
+            return False
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setWindowTitle("Có bản cập nhật mới")
+        box.setText(
+            f"Đã có phiên bản mới v{remote_version}.\n"
+            "Yes: Tải về thư mục Temp và mở file cài đặt\n"
+            "No: Mở trang tải trong trình duyệt"
+        )
+        box.setStandardButtons(
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No
+            | QMessageBox.StandardButton.Cancel
+        )
+        box.setDefaultButton(QMessageBox.StandardButton.Yes)
+        choice = box.exec()
+
+        if choice == QMessageBox.StandardButton.Yes:
+            self.download_and_open_update(download_url, remote_version)
+            return True
+        if choice == QMessageBox.StandardButton.No:
+            webbrowser.open(download_url)
+            return True
+        return False
+
+    def download_and_open_update(self, download_url: str, remote_version: str):
+        try:
+            downloaded = self.download_release_to_temp(download_url, remote_version)
+        except Exception as err:
+            self.append_log("warning", f"[update] Tải file cập nhật thất bại: {clean_log_text(err)}")
+            ask = QMessageBox.question(self, "Tải thất bại", "Không tải được file cập nhật tự động. Mở trang tải?")
+            if ask == QMessageBox.StandardButton.Yes:
+                webbrowser.open(download_url)
+            return
+
+        self.append_log("info", f"[update] Đã tải bản cập nhật về: {downloaded}")
+        self.open_downloaded_installer(downloaded)
+
+    def download_release_to_temp(self, download_url: str, remote_version: str) -> str:
+        req = urllib.request.Request(
+            download_url,
+            headers={"User-Agent": f"{CONFIG_APP_NAME}/{self.current_version}"},
+        )
+
+        temp_dir = Path(tempfile.gettempdir()) / "dlp-master-updates"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+
+        with urllib.request.urlopen(req, timeout=45) as response:
+            content_type = (response.headers.get_content_type() or "").lower()
+            if content_type.startswith("text/html"):
+                raise ValueError("download_url hiện trỏ tới trang web, không phải file cài đặt trực tiếp")
+
+            parsed = urllib.parse.urlparse(download_url)
+            file_name = Path(urllib.parse.unquote(parsed.path)).name.strip()
+            if not file_name:
+                ext_by_type = {
+                    "application/x-msdos-program": ".exe",
+                    "application/x-msdownload": ".exe",
+                    "application/octet-stream": ".exe",
+                    "application/x-msi": ".msi",
+                    "application/zip": ".zip",
+                }
+                suffix = ext_by_type.get(content_type, ".bin")
+                file_name = f"DLP-Master-v{remote_version}{suffix}"
+
+            target_path = temp_dir / file_name
+            if target_path.exists():
+                target_path = temp_dir / f"{target_path.stem}-{uuid.uuid4().hex[:8]}{target_path.suffix}"
+
+            with target_path.open("wb") as out_file:
+                shutil.copyfileobj(response, out_file)
+
+        return str(target_path)
+
+    def open_downloaded_installer(self, local_file: str):
+        path = Path(local_file)
+        if not path.exists():
+            QMessageBox.warning(self, "Cập nhật", "Không tìm thấy file cập nhật vừa tải.")
+            return
+
+        if sys.platform.startswith("win"):
+            os.startfile(str(path))
+        else:
+            subprocess.Popen([str(path)])
+
+        self.append_log("success", "[update] Đã mở file cập nhật. Hãy đóng app hiện tại trước khi cài bản mới.")
 
     def open_login_dialog(self):
         if not WEBENGINE_AVAILABLE:
