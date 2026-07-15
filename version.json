@@ -1,5 +1,8 @@
 {
-	"version": "2.0.3",
-	"download_url": "https://github.com/thienhash-coder/DLP-Master/releases/download/v2.0.3/DLP-Master-Qt.zip",
-	"notes": "DLP Master Qt release"
+  "version": "2.0.3",
+  "minimum_version": "2.0.0",
+  "channel": "stable",
+  "download_url": "https://github.com/thienhash-coder/dlp-master/releases/download/v2.0.3/DLP-Master-Qt-v2.0.3-win64.zip",
+  "sha256": "56325424BBC94C9A033436901644BC307BED4A1D3E55BC65D9C1513EE78EE31D",
+  "release_notes": "Professional update system groundwork with standalone updater, SHA256 verification, backup, rollback, and restart flow."
 }

@@ -55,6 +55,7 @@ The app reads update settings from:
 Create a Windows Qt package with bundled ffmpeg:
 
 ```bash
+python -m PyInstaller --noconfirm Updater.spec
 python -m PyInstaller --noconfirm "DLP Master Qt.spec"
 ```
 

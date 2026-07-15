@@ -103,14 +103,25 @@ BASE_DIR = Path(__file__).resolve().parent
 DOWNLOAD_DIR = BASE_DIR / "downloads"
 MAX_CONCURRENT_DOWNLOADS = 2
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-VERSION = "2.0.1"
+VERSION = "2.0.3"
 
 try:
     from app_config import APP_NAME as CONFIG_APP_NAME, CURRENT_VERSION as CONFIG_CURRENT_VERSION, UPDATE_URL
+    try:
+        from app_config import UPDATE_CHANNEL as CONFIG_UPDATE_CHANNEL
+    except Exception:
+        CONFIG_UPDATE_CHANNEL = "stable"
 except Exception:
     CONFIG_APP_NAME = "DLP Master"
     CONFIG_CURRENT_VERSION = VERSION
     UPDATE_URL = ""
+    CONFIG_UPDATE_CHANNEL = "stable"
+
+from update.downloader import DownloadCancelled, DownloadProgress, ReleaseDownloader
+from update.hash import verify_sha256
+from update.update_dialog import UpdateDialog
+from update.updater_launcher import app_root, launch_updater
+from update.version_checker import UpdateCheckError, UpdateCheckResult, VersionChecker
 
 PLATFORM_LOGIN_URLS = {
     "TikTok": "https://www.tiktok.com/login",
@@ -1045,6 +1056,84 @@ class UpdateThread(QThread):
             self.update_finished.emit(False, f"Loi khi cap nhat yt-dlp: {exc}")
 
 
+class UpdateCheckThread(QThread):
+    update_checked = pyqtSignal(bool, object, str)
+
+    def __init__(self, update_url: str, current_version: str, app_name: str, channel: str):
+        super().__init__()
+        self.update_url = update_url
+        self.current_version = current_version
+        self.app_name = app_name
+        self.channel = channel
+
+    def run(self):
+        try:
+            checker = VersionChecker(self.update_url, self.current_version, self.app_name, self.channel)
+            result = checker.check()
+            self.update_checked.emit(True, result, "")
+        except Exception as exc:
+            self.update_checked.emit(False, None, clean_log_text(exc))
+
+
+class UpdateDownloadThread(QThread):
+    download_progress = pyqtSignal(int, str)
+    download_finished = pyqtSignal(bool, str, str)
+
+    def __init__(self, manifest, target_dir: str, app_name: str):
+        super().__init__()
+        self.manifest = manifest
+        self.target_dir = target_dir
+        self.app_name = app_name
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        try:
+            downloader = ReleaseDownloader(self.manifest.download_url, self.target_dir, self.app_name)
+            package_path = downloader.download(
+                self.manifest.version,
+                progress_callback=self._emit_progress,
+                cancel_callback=lambda: self._cancelled,
+            )
+            if self._cancelled:
+                self.download_finished.emit(False, "", "Download cancelled")
+                return
+            if not verify_sha256(package_path, self.manifest.sha256):
+                self.download_finished.emit(False, "", "SHA256 verification failed")
+                return
+            self.download_finished.emit(True, str(package_path), "Download verified")
+        except DownloadCancelled as exc:
+            self.download_finished.emit(False, "", str(exc))
+        except Exception as exc:
+            self.download_finished.emit(False, "", clean_log_text(exc))
+
+    def _emit_progress(self, progress: DownloadProgress):
+        speed = self._format_bytes(progress.speed_bps) + "/s"
+        eta = self._format_eta(progress.eta_seconds)
+        total = self._format_bytes(progress.total) if progress.total else "-"
+        downloaded = self._format_bytes(progress.downloaded)
+        self.download_progress.emit(progress.percent, f"{downloaded}/{total} | {speed} | ETA {eta}")
+
+    @staticmethod
+    def _format_bytes(value: int | float) -> str:
+        units = ["B", "KB", "MB", "GB"]
+        size = float(value or 0)
+        index = 0
+        while size >= 1024 and index < len(units) - 1:
+            size /= 1024
+            index += 1
+        return f"{size:.1f} {units[index]}"
+
+    @staticmethod
+    def _format_eta(seconds: int | None) -> str:
+        if seconds is None:
+            return "-"
+        minutes, secs = divmod(max(0, int(seconds)), 60)
+        return f"{minutes:02d}:{secs:02d}"
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1054,6 +1143,7 @@ class MainWindow(QMainWindow):
 
         self.current_version = (str(CONFIG_CURRENT_VERSION).strip() or VERSION).lstrip("vV")
         self.update_url = str(UPDATE_URL).strip()
+        self.update_channel = str(CONFIG_UPDATE_CHANNEL or "stable").strip().lower()
         self.latest_release_url = ""
 
         self.settings = AppSettings(output_dir=self.get_default_download_dir())
@@ -1063,6 +1153,12 @@ class MainWindow(QMainWindow):
         self.force_stop_timers: dict[str, QTimer] = {}
         self.sidebar_buttons: list[QPushButton] = []
         self.update_thread: UpdateThread | None = None
+        self.update_check_thread: UpdateCheckThread | None = None
+        self.update_download_thread: UpdateDownloadThread | None = None
+        self.update_dialog: UpdateDialog | None = None
+        self.pending_update_result: UpdateCheckResult | None = None
+        self.downloaded_update_package = ""
+        self.skipped_update_version = ""
         self.update_prompted_version = ""
 
         self.setWindowTitle("yt-dlp Queue Downloader")
@@ -1299,22 +1395,43 @@ class MainWindow(QMainWindow):
         self.sponsorblock_checkbox = QCheckBox("Cắt quảng cáo với SponsorBlock")
         self.sponsorblock_checkbox.setChecked(self.settings.sponsorblock)
 
+        channel_row = QHBoxLayout()
+        channel_label = QLabel("Update Channel")
+        channel_label.setObjectName("Hint")
+        self.update_channel_combo = QComboBox()
+        self.update_channel_combo.addItems(["stable", "beta", "nightly"])
+        self.update_channel_combo.setCurrentText(self.update_channel if self.update_channel in {"stable", "beta", "nightly"} else "stable")
+        self.update_channel_combo.currentTextChanged.connect(self.set_update_channel)
+        channel_row.addWidget(channel_label)
+        channel_row.addWidget(self.update_channel_combo, 1)
+
         update_row = QHBoxLayout()
         self.update_info_label = QLabel(f"Phiên bản hiện tại: v{self.current_version}")
         self.update_info_label.setObjectName("Hint")
+        self.latest_version_label = QLabel("Latest Version: -")
+        self.latest_version_label.setObjectName("Hint")
         self.check_update_button = QPushButton("Kiểm tra cập nhật")
         self.check_update_button.setObjectName("SettingsButton")
         self.check_update_button.clicked.connect(lambda: self.check_for_updates(manual=True))
         update_row.addWidget(self.update_info_label)
+        update_row.addWidget(self.latest_version_label)
         update_row.addStretch(1)
         update_row.addWidget(self.check_update_button)
+
+        self.release_notes_view = QTextBrowser()
+        self.release_notes_view.setObjectName("HelpBrowser")
+        self.release_notes_view.setReadOnly(True)
+        self.release_notes_view.setMaximumHeight(120)
+        self.release_notes_view.setPlainText("Release Notes: -")
 
         layout.addLayout(row1)
         layout.addWidget(self.write_subs_checkbox)
         layout.addWidget(self.embed_subs_checkbox)
         layout.addWidget(self.embed_thumb_checkbox)
         layout.addWidget(self.sponsorblock_checkbox)
+        layout.addLayout(channel_row)
         layout.addLayout(update_row)
+        layout.addWidget(self.release_notes_view)
         layout.addLayout(folder_row)
         layout.addWidget(self.cookie_status)
         layout.addStretch(1)
@@ -1777,17 +1894,9 @@ class MainWindow(QMainWindow):
         else:
             self.cookie_status.setText("Cookie mode: Public/Ẩn danh (chưa đăng nhập)")
 
-    def fetch_release_info(self) -> ReleaseInfo | None:
-        if not self.update_url:
-            return None
-
-        req = urllib.request.Request(
-            self.update_url,
-            headers={"User-Agent": f"{CONFIG_APP_NAME}/{self.current_version}"},
-        )
-        with urllib.request.urlopen(req, timeout=8) as response:
-            body = response.read().decode("utf-8", errors="replace")
-        return parse_release_info(body)
+    def set_update_channel(self, channel: str):
+        self.update_channel = (channel or "stable").strip().lower()
+        self.append_log("info", f"[update] Update channel: {self.update_channel}")
 
     def check_for_updates_silent(self):
         self.check_for_updates(manual=False)
@@ -1796,116 +1905,130 @@ class MainWindow(QMainWindow):
         if not self.update_url:
             self.append_log("warning", "[update] Chưa cấu hình UPDATE_URL trong app_config.py")
             return
-        try:
-            release = self.fetch_release_info()
-        except Exception as err:
-            self.append_log("warning", f"[update] Không thể kiểm tra cập nhật: {clean_log_text(err)}")
+        if self.update_check_thread and self.update_check_thread.isRunning():
             return
 
-        if not release:
+        if manual:
+            self.append_log("info", "[update] Đang kiểm tra cập nhật...")
+        self.check_update_button.setEnabled(False)
+        self.update_check_thread = UpdateCheckThread(
+            self.update_url,
+            self.current_version,
+            CONFIG_APP_NAME,
+            self.update_channel,
+        )
+        self.update_check_thread.update_checked.connect(lambda ok, result, message, manual=manual: self.on_update_check_completed(ok, result, message, manual))
+        self.update_check_thread.finished.connect(self.update_check_thread.deleteLater)
+        self.update_check_thread.finished.connect(self._clear_update_check_thread)
+        self.update_check_thread.start()
+
+    def _clear_update_check_thread(self):
+        self.update_check_thread = None
+        if hasattr(self, "check_update_button"):
+            self.check_update_button.setEnabled(True)
+
+    def on_update_check_completed(self, success: bool, result: UpdateCheckResult | None, message: str, manual: bool):
+        if not success or not result:
+            self.append_log("warning", f"[update] Không thể kiểm tra cập nhật: {clean_log_text(message)}")
+            if manual and hasattr(self, "release_notes_view"):
+                self.release_notes_view.setPlainText(f"Update error: {clean_log_text(message)}")
             return
 
-        if release.download_url:
-            self.latest_release_url = release.download_url
+        self.pending_update_result = result
+        manifest = result.manifest
+        self.latest_release_url = manifest.download_url
+        if hasattr(self, "latest_version_label"):
+            self.latest_version_label.setText(f"Latest Version: v{result.latest_version}")
+        if hasattr(self, "release_notes_view"):
+            self.release_notes_view.setPlainText(manifest.release_notes or "Release Notes: -")
 
-        remote_version = (release.version or "").strip().lstrip("vV")
-        if remote_version and is_remote_version_newer(remote_version, self.current_version):
-            self.append_log("warning", f"[update] Có phiên bản mới v{remote_version} (hiện tại v{self.current_version}).")
-            if not manual and self.update_prompted_version == remote_version:
+        if not result.is_supported:
+            self.append_log("warning", f"[update] Phiên bản hiện tại thấp hơn minimum_version v{manifest.minimum_version}.")
+
+        if result.update_available:
+            self.append_log("warning", f"[update] Có phiên bản mới v{result.latest_version} (hiện tại v{result.current_version}).")
+            if result.latest_version == self.skipped_update_version:
                 return
-            if self.prompt_update_actions(remote_version, release.download_url):
-                self.update_prompted_version = remote_version
+            if manual or self.update_prompted_version != result.latest_version:
+                self.update_prompted_version = result.latest_version
+                self.show_update_dialog(result)
+        elif manual:
+            self.append_log("success", f"[update] Đang ở phiên bản mới nhất: v{self.current_version}")
 
-    def prompt_update_actions(self, remote_version: str, download_url: str) -> bool:
-        if not download_url:
-            self.append_log("warning", "[update] Có bản mới nhưng chưa có download_url.")
-            return False
+    def show_update_dialog(self, result: UpdateCheckResult):
+        dialog = UpdateDialog(result.current_version, result.latest_version, result.manifest.release_notes, self)
+        dialog.skip_button.clicked.connect(lambda: self.skip_update_version(result.latest_version))
+        dialog.later_button.clicked.connect(dialog.close)
+        dialog.download_button.clicked.connect(lambda: self.start_update_download(result.manifest))
+        dialog.install_button.clicked.connect(self.install_downloaded_update)
+        dialog.cancel_button.clicked.connect(self.cancel_update_download)
+        self.update_dialog = dialog
+        dialog.show()
 
-        box = QMessageBox(self)
-        box.setIcon(QMessageBox.Icon.Information)
-        box.setWindowTitle("Có bản cập nhật mới")
-        box.setText(
-            f"Đã có phiên bản mới v{remote_version}.\n"
-            "Yes: Tải về thư mục Temp và mở file cài đặt\n"
-            "No: Mở trang tải trong trình duyệt"
-        )
-        box.setStandardButtons(
-            QMessageBox.StandardButton.Yes
-            | QMessageBox.StandardButton.No
-            | QMessageBox.StandardButton.Cancel
-        )
-        box.setDefaultButton(QMessageBox.StandardButton.Yes)
-        choice = box.exec()
+    def skip_update_version(self, version: str):
+        self.skipped_update_version = version
+        self.append_log("info", f"[update] Đã bỏ qua phiên bản v{version}")
+        if self.update_dialog:
+            self.update_dialog.close()
 
-        if choice == QMessageBox.StandardButton.Yes:
-            self.download_and_open_update(download_url, remote_version)
-            return True
-        if choice == QMessageBox.StandardButton.No:
-            webbrowser.open(download_url)
-            return True
-        return False
-
-    def download_and_open_update(self, download_url: str, remote_version: str):
-        try:
-            downloaded = self.download_release_to_temp(download_url, remote_version)
-        except Exception as err:
-            self.append_log("warning", f"[update] Tải file cập nhật thất bại: {clean_log_text(err)}")
-            ask = QMessageBox.question(self, "Tải thất bại", "Không tải được file cập nhật tự động. Mở trang tải?")
-            if ask == QMessageBox.StandardButton.Yes:
-                webbrowser.open(download_url)
+    def start_update_download(self, manifest):
+        if self.update_download_thread and self.update_download_thread.isRunning():
             return
+        target_dir = Path(tempfile.gettempdir()) / "dlp-master-updates"
+        self.downloaded_update_package = ""
+        if self.update_dialog:
+            self.update_dialog.set_download_running(True)
+            self.update_dialog.set_progress(0, "Đang tải bản cập nhật...")
 
-        self.append_log("info", f"[update] Đã tải bản cập nhật về: {downloaded}")
-        self.open_downloaded_installer(downloaded)
+        self.update_download_thread = UpdateDownloadThread(manifest, str(target_dir), CONFIG_APP_NAME)
+        self.update_download_thread.download_progress.connect(self.on_update_download_progress)
+        self.update_download_thread.download_finished.connect(self.on_update_download_finished)
+        self.update_download_thread.finished.connect(self.update_download_thread.deleteLater)
+        self.update_download_thread.finished.connect(self._clear_update_download_thread)
+        self.update_download_thread.start()
 
-    def download_release_to_temp(self, download_url: str, remote_version: str) -> str:
-        req = urllib.request.Request(
-            download_url,
-            headers={"User-Agent": f"{CONFIG_APP_NAME}/{self.current_version}"},
-        )
+    def on_update_download_progress(self, percent: int, status: str):
+        if self.update_dialog:
+            self.update_dialog.set_progress(percent, status)
 
-        temp_dir = Path(tempfile.gettempdir()) / "dlp-master-updates"
-        temp_dir.mkdir(parents=True, exist_ok=True)
-
-        with urllib.request.urlopen(req, timeout=45) as response:
-            content_type = (response.headers.get_content_type() or "").lower()
-            if content_type.startswith("text/html"):
-                raise ValueError("download_url hiện trỏ tới trang web, không phải file cài đặt trực tiếp")
-
-            parsed = urllib.parse.urlparse(download_url)
-            file_name = Path(urllib.parse.unquote(parsed.path)).name.strip()
-            if not file_name:
-                ext_by_type = {
-                    "application/x-msdos-program": ".exe",
-                    "application/x-msdownload": ".exe",
-                    "application/octet-stream": ".exe",
-                    "application/x-msi": ".msi",
-                    "application/zip": ".zip",
-                }
-                suffix = ext_by_type.get(content_type, ".bin")
-                file_name = f"DLP-Master-v{remote_version}{suffix}"
-
-            target_path = temp_dir / file_name
-            if target_path.exists():
-                target_path = temp_dir / f"{target_path.stem}-{uuid.uuid4().hex[:8]}{target_path.suffix}"
-
-            with target_path.open("wb") as out_file:
-                shutil.copyfileobj(response, out_file)
-
-        return str(target_path)
-
-    def open_downloaded_installer(self, local_file: str):
-        path = Path(local_file)
-        if not path.exists():
-            QMessageBox.warning(self, "Cập nhật", "Không tìm thấy file cập nhật vừa tải.")
-            return
-
-        if sys.platform.startswith("win"):
-            os.startfile(str(path))
+    def on_update_download_finished(self, success: bool, package_path: str, message: str):
+        if success:
+            self.downloaded_update_package = package_path
+            self.append_log("success", f"[update] Đã tải và xác minh SHA256: {package_path}")
+            if self.update_dialog:
+                self.update_dialog.set_progress(100, "Đã tải xong và xác minh SHA256. Sẵn sàng cài đặt.")
+                self.update_dialog.set_ready_to_install(True)
         else:
-            subprocess.Popen([str(path)])
+            self.append_log("warning", f"[update] Tải cập nhật thất bại: {clean_log_text(message)}")
+            if self.update_dialog:
+                self.update_dialog.set_progress(0, f"Tải cập nhật thất bại: {clean_log_text(message)}")
+                self.update_dialog.set_download_running(False)
 
-        self.append_log("success", "[update] Đã mở file cập nhật. Hãy đóng app hiện tại trước khi cài bản mới.")
+    def _clear_update_download_thread(self):
+        self.update_download_thread = None
+
+    def cancel_update_download(self):
+        if self.update_download_thread and self.update_download_thread.isRunning():
+            self.update_download_thread.cancel()
+            self.append_log("warning", "[update] Đang hủy tải cập nhật...")
+
+    def install_downloaded_update(self):
+        if not self.downloaded_update_package:
+            self.append_log("warning", "[update] Chưa có gói cập nhật đã tải.")
+            return
+        if self.active_threads:
+            self.append_log("warning", "[update] Hãy dừng hoặc đợi các task tải hoàn tất trước khi cài cập nhật.")
+            return
+        try:
+            launch_updater(self.downloaded_update_package, app_root(), restart=True)
+        except Exception as err:
+            self.append_log("error", f"[update] Không thể mở updater: {clean_log_text(err)}")
+            return
+
+        self.append_log("success", "[update] Đã mở DLP Master Updater. Ứng dụng chính sẽ đóng để cài cập nhật.")
+        if self.update_dialog:
+            self.update_dialog.close()
+        QTimer.singleShot(250, QApplication.instance().quit)
 
     def open_login_dialog(self):
         if not WEBENGINE_AVAILABLE:

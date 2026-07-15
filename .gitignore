@@ -71,6 +71,7 @@ wine-py2exe/
 py2exe.log
 build/
 dist/
+release-v*/
 zip/
 tmp/
 venv/
@@ -103,6 +104,9 @@ README.txt
 *.tar.gz
 *.zsh
 *.spec
+!DLP Master Qt.spec
+!yt_dlp_qt_gui.spec
+!Updater.spec
 test/testdata/sigs/player-*.js
 test/testdata/thumbnails/empty.webp
 test/testdata/thumbnails/foo\ %d\ bar/foo_%d.*
