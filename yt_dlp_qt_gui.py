@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import json
+import socket
 import shutil
 import subprocess
 import sys
@@ -35,11 +36,11 @@ try:
         QDialogButtonBox,
         QFileDialog,
         QFrame,
+        QGridLayout,
         QHBoxLayout,
         QLabel,
         QLineEdit,
         QMainWindow,
-        QMessageBox,
         QProgressBar,
         QPushButton,
         QScrollArea,
@@ -63,11 +64,11 @@ except ImportError:
             QDialogButtonBox,
             QFileDialog,
             QFrame,
+            QGridLayout,
             QHBoxLayout,
             QLabel,
             QLineEdit,
             QMainWindow,
-            QMessageBox,
             QProgressBar,
             QPushButton,
             QScrollArea,
@@ -122,6 +123,17 @@ from update.hash import verify_sha256
 from update.update_dialog import UpdateDialog
 from update.updater_launcher import app_root, launch_updater
 from update.version_checker import UpdateCheckError, UpdateCheckResult, VersionChecker
+from theme.theme import apply_theme
+from widgets.card import CardFrame
+from widgets.download_card import DownloadCard
+from widgets.header import AppHeader
+from widgets.notification import NotificationManager
+from widgets.queue_table import QueueTable
+from widgets.settings_card import SettingsCard
+from widgets.sidebar import AppSidebar
+from widgets.statusbar import AppStatusBar
+from widgets.update_card import UpdateCard
+from utils.file_name import FilenameFormatter
 
 PLATFORM_LOGIN_URLS = {
     "TikTok": "https://www.tiktok.com/login",
@@ -211,6 +223,20 @@ class ReleaseInfo:
     notes: str = ""
 
 
+@dataclass
+class QueueRowState:
+    task_id: str
+    url: str
+    title: str
+    status: str = "Queued"
+    progress: str = "0%"
+    speed: str = "-"
+    eta: str = "-"
+    size: str = "-"
+    format_label: str = "-"
+    details: str = "-"
+
+
 def parse_version_tuple(version_text: str) -> tuple[int, ...]:
     parts = re.findall(r"\d+", str(version_text))
     return tuple(int(part) for part in parts)
@@ -273,6 +299,32 @@ def parse_release_info(raw_payload: str) -> ReleaseInfo | None:
     return ReleaseInfo(version=text.lstrip("vV"), download_url="")
 
 
+def simplify_release_notes(version: str, notes_text: str) -> str:
+    raw_lines = [line.strip(" -*\t") for line in str(notes_text or "").splitlines() if line.strip()]
+    picked: list[str] = []
+    for line in raw_lines:
+        lowered = line.lower()
+        if any(token in lowered for token in ("http", "sha", "commit", "merge", "pull request", "issue #")):
+            continue
+        if len(line) < 4:
+            continue
+        picked.append(line[:120])
+        if len(picked) >= 4:
+            break
+
+    if not picked:
+        picked = [
+            "Improve download stability",
+            "Refine platform compatibility",
+            "Enhance update experience",
+        ]
+
+    safe_version = str(version or "-").strip()
+    lines = [f"Version {safe_version}", ""]
+    lines.extend([f"✓ {item}" for item in picked])
+    return "\n".join(lines)
+
+
 class DownloadSignals(QObject):
     log = pyqtSignal(str, str)
     metadata = pyqtSignal(str, str, str)
@@ -323,6 +375,7 @@ class DownloadWorker(QObject):
         super().__init__()
         self.task = task
         self.settings = settings
+        self.filename_formatter = FilenameFormatter(max_length=120, fallback_title="Untitled")
         self.signals = DownloadSignals()
         self.stop_event = threading.Event()
         self._cancel_emitted = False
@@ -353,15 +406,12 @@ class DownloadWorker(QObject):
         target_dir = self.settings.output_dir.strip() or str(DOWNLOAD_DIR)
         Path(target_dir).mkdir(parents=True, exist_ok=True)
         opts = {
-            # SỬA DÒNG NÀY: Giới hạn tiêu đề video lấy tối đa 100 ký tự để tránh lỗi quá dài
-            "outtmpl": os.path.join(target_dir, "%(title).100s.%(ext)s"),
+            "outtmpl": os.path.join(target_dir, "%(title)s.%(ext)s"),
             "logger": QtYtDlpLogger(self.signals, self.task.task_id, is_cancelled=self.stop_event.is_set),
             "progress_hooks": [self.progress_hook],
-            
-            # BỔ SUNG 2 DÒNG NÀY: Ép buộc tên file tuân thủ quy tắc Windows và loại bỏ ký tự lạ ASCII
-            "windowsfilenames": True,
-            "restrictfilenames": True,  # Loại bỏ khoảng trắng phức tạp, dấu tiếng Việt và ký tự đặc biệt gây lỗi
-            
+            "windowsfilenames": False,
+            "restrictfilenames": False,
+            "match_filter": self._apply_formatted_title,
             "retries": 3,
             "fragment_retries": 3,
             "extractor_retries": 3,
@@ -447,6 +497,31 @@ class DownloadWorker(QObject):
             opts["postprocessors"] = postprocessors
 
         return opts
+
+    def _apply_formatted_title(self, info_dict: dict, *, incomplete=False):
+        if not isinstance(info_dict, dict):
+            return None
+
+        if info_dict.get("_dlp_title_formatted"):
+            return None
+
+        raw_title = info_dict.get("title") or info_dict.get("fulltitle") or info_dict.get("id") or ""
+        ext = info_dict.get("ext") or self._expected_extension()
+        target_dir = self.settings.output_dir.strip() or str(DOWNLOAD_DIR)
+
+        unique_filename = self.filename_formatter.make_unique_filename(raw_title, ext, target_dir)
+        info_dict["title"] = Path(unique_filename).stem
+        info_dict["_dlp_title_formatted"] = True
+        return None
+
+    def _expected_extension(self) -> str:
+        return {
+            "MP4": "mp4",
+            "MP4 (Convert)": "mp4",
+            "MKV": "mkv",
+            "MP3": "mp3",
+            "FLAC": "flac",
+        }.get(self.settings.output_format, "")
 
     @staticmethod
     def is_subtitle_rate_limit_error(error_text: str) -> bool:
@@ -662,7 +737,6 @@ class QueueItemWidget(QFrame):
         self.style().unpolish(self.status)
         self.style().polish(self.status)
 
-
 class EmbeddedLoginDialog(QDialog):
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -737,7 +811,7 @@ class EmbeddedLoginDialog(QDialog):
         self.current_url = target_url
         self.view.load(QUrl(target_url))
         self.info_label.setText(
-            f"Đang đăng nhập {self.selected_platform}. Sau khi xong, đóng cửa sổ để lưu cookie tự động."
+            "Đang đăng nhập {platform}. Sau khi xong, đóng cửa sổ để lưu cookie tự động.".format(platform=self.selected_platform)
         )
         try:
             self.cookie_store.loadAllCookies()
@@ -750,7 +824,7 @@ class EmbeddedLoginDialog(QDialog):
             return
         key = (record.domain, record.path, record.name)
         self.cookies[key] = record
-        self.info_label.setText(f"Đã ghi nhận {len(self.cookies)} cookie. Có thể đóng cửa sổ khi đăng nhập xong.")
+        self.info_label.setText("Đã ghi nhận {count} cookie. Có thể đóng cửa sổ khi đăng nhập xong.".format(count=len(self.cookies)))
         self.maybe_auto_close_on_login(record)
 
     def on_cookie_removed(self, cookie):
@@ -760,7 +834,7 @@ class EmbeddedLoginDialog(QDialog):
         key = (record.domain, record.path, record.name)
         if key in self.cookies:
             del self.cookies[key]
-        self.info_label.setText(f"Đã ghi nhận {len(self.cookies)} cookie. Có thể đóng cửa sổ khi đăng nhập xong.")
+        self.info_label.setText("Đã ghi nhận {count} cookie. Có thể đóng cửa sổ khi đăng nhập xong.".format(count=len(self.cookies)))
 
     def to_record(self, cookie) -> CapturedCookie | None:
         try:
@@ -825,7 +899,7 @@ class EmbeddedLoginDialog(QDialog):
         self.auto_close_armed = True
         self.auth_verified = True
         self.info_label.setText(
-            f"Đăng nhập {self.selected_platform} thành công. Cửa sổ sẽ tự động đóng..."
+            "Đăng nhập {platform} thành công. Cửa sổ sẽ tự động đóng...".format(platform=self.selected_platform)
         )
         QTimer.singleShot(700, self.close)
 
@@ -852,22 +926,19 @@ class EmbeddedLoginDialog(QDialog):
     def confirm_login_and_close(self):
         platform_count, auth_count = self.get_platform_cookie_stats()
         if auth_count == 0:
-            QMessageBox.warning(
-                self,
-                "Chưa thấy cookie đăng nhập",
-                (
-                    f"Chưa phát hiện cookie đăng nhập hợp lệ cho {self.selected_platform}.\n"
-                    "Bạn hãy đăng nhập xong, đợi trang tải lại rồi bấm nút này lần nữa."
-                ),
-            )
             self.info_label.setText(
-                f"Đã ghi nhận {len(self.cookies)} cookie tổng, {platform_count} cookie nền tảng, {auth_count} cookie đăng nhập."
+                "Chưa phát hiện cookie đăng nhập hợp lệ cho {platform}. Đã ghi nhận {total} cookie tổng, {platform_count} cookie nền tảng, {auth_count} cookie đăng nhập.".format(
+                    platform=self.selected_platform,
+                    total=len(self.cookies),
+                    platform_count=platform_count,
+                    auth_count=auth_count,
+                )
             )
             return
 
         self.auth_verified = True
         self.info_label.setText(
-            f"Xác nhận đăng nhập {self.selected_platform} thành công ({auth_count} cookie đăng nhập). Đang lưu cookie..."
+            "Xác nhận đăng nhập {platform} thành công ({auth_count} cookie đăng nhập). Đang lưu cookie...".format(platform=self.selected_platform, auth_count=auth_count)
         )
         self.close()
 
@@ -891,7 +962,7 @@ class EmbeddedLoginDialog(QDialog):
         target = Path(tempfile.gettempdir()) / f"yt_dlp_web_cookie_{uuid.uuid4().hex}.txt"
         lines = [
             "# Netscape HTTP Cookie File\n",
-            "# This file was generated by embedded Qt WebEngine login\n",
+            "# Tệp này được tạo bởi đăng nhập Qt WebEngine nhúng\n",
             "\n",
         ]
 
@@ -925,7 +996,6 @@ class EmbeddedLoginDialog(QDialog):
                 pass
         super().closeEvent(event)
 
-
 class SettingsDialog(QDialog):
     def __init__(self, current: AppSettings, parent: QWidget | None = None):
         super().__init__(parent)
@@ -940,24 +1010,24 @@ class SettingsDialog(QDialog):
         layout.setContentsMargins(18, 18, 18, 18)
         layout.setSpacing(14)
 
-        format_label = QLabel("Định dạng đầu ra")
+        format_label = QLabel("Định dạng")
         self.format_combo = QComboBox()
         self.format_combo.addItems(["MP4", "MP4 (Convert)", "MKV", "MP3", "FLAC"])
         self.format_combo.setCurrentText(current.output_format)
 
-        self.write_subs = QCheckBox("Tải xuống phụ đề")
+        self.write_subs = QCheckBox("Phụ đề")
         self.write_subs.setChecked(current.write_subs)
 
-        self.embed_subs_checkbox = QCheckBox("Nhúng phụ đề vào video")
+        self.embed_subs_checkbox = QCheckBox("Nhúng phụ đề")
         self.embed_subs_checkbox.setChecked(current.embed_subs_checkbox)
 
-        self.embed_thumb = QCheckBox("Nhúng thumbnail vào file")
+        self.embed_thumb = QCheckBox("Ảnh đại diện")
         self.embed_thumb.setChecked(current.embed_thumbnail)
 
-        self.sponsorblock = QCheckBox("Cắt quảng cáo với SponsorBlock")
+        self.sponsorblock = QCheckBox("Loại bỏ quảng cáo SponsorBlock")
         self.sponsorblock.setChecked(current.sponsorblock)
 
-        self.login_button = QPushButton("🔑 Đăng nhập tài khoản để tải video giới hạn")
+        self.login_button = QPushButton("Đăng nhập tài khoản để tải video giới hạn")
         self.login_button.setObjectName("LoginButton")
         self.login_button.clicked.connect(self.open_login_dialog)
 
@@ -990,17 +1060,17 @@ class SettingsDialog(QDialog):
         layout.addWidget(actions)
 
         if not WEBENGINE_AVAILABLE:
-            self.cookie_status.setText("Qt WebEngine chưa sẵn sàng. Cài: pip install PyQt6-WebEngine")
+            self.cookie_status.setText("[đăng nhập] Qt WebEngine chưa sẵn sàng. Cài đặt thêm: pip install PyQt6-WebEngine")
 
     def update_cookie_status(self):
         if self.cookie_file_path and Path(self.cookie_file_path).exists():
-            self.cookie_status.setText(f"Cookie đang sử dụng: {self.cookie_file_path}")
+            self.cookie_status.setText("Cookie đang sử dụng: {path}".format(path=self.cookie_file_path))
         else:
-            self.cookie_status.setText("Cookie mode: Public/Ẩn danh (chưa đăng nhập)")
+            self.cookie_status.setText("Chế độ cookie: Công khai/Ẩn danh (chưa đăng nhập)")
 
     def open_login_dialog(self):
         if not WEBENGINE_AVAILABLE:
-            QMessageBox.warning(self, "Thiếu WebEngine", "Cài đặt thêm: pip install PyQt6-WebEngine")
+            self.cookie_status.setText("[đăng nhập] Qt WebEngine chưa sẵn sàng. Cài đặt thêm: pip install PyQt6-WebEngine")
             return
 
         old_cookie = self.cookie_file_path
@@ -1019,7 +1089,7 @@ class SettingsDialog(QDialog):
                     pass
             self.update_cookie_status()
         elif not new_cookie_file:
-            QMessageBox.information(self, "Cookie", "Chưa thu được cookie nào. Hãy đăng nhập rồi đóng cửa sổ trình duyệt.")
+            self.cookie_status.setText("Chưa thu được cookie nào. Hãy đăng nhập rồi đóng cửa sổ trình duyệt.")
 
     def get_settings(self) -> AppSettings:
         return AppSettings(
@@ -1036,6 +1106,10 @@ class SettingsDialog(QDialog):
 class UpdateThread(QThread):
     update_finished = pyqtSignal(bool, str)
 
+    def __init__(self, messages: dict[str, str] | None = None):
+        super().__init__()
+        self.messages = messages or {}
+
     def run(self):
         command = [sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp"]
         try:
@@ -1047,13 +1121,17 @@ class UpdateThread(QThread):
             )
             output = (result.stdout or result.stderr or "").strip()
             if result.returncode == 0:
-                message = output or "yt-dlp da duoc cap nhat thanh cong."
+                message = output or self.messages.get("success", "yt-dlp đã được cập nhật thành công.")
                 self.update_finished.emit(True, message)
             else:
-                message = output or f"pip ket thuc voi ma loi {result.returncode}."
+                template = self.messages.get("pip_error", "pip kết thúc với mã lỗi {code}.")
+                message = output or template.format(code=result.returncode)
                 self.update_finished.emit(False, message)
         except Exception as exc:
-            self.update_finished.emit(False, f"Loi khi cap nhat yt-dlp: {exc}")
+            self.update_finished.emit(
+                False,
+                self.messages.get("exception", "Lỗi khi cập nhật yt-dlp: {error}").format(error=exc),
+            )
 
 
 class UpdateCheckThread(QThread):
@@ -1079,12 +1157,13 @@ class UpdateDownloadThread(QThread):
     download_progress = pyqtSignal(int, str)
     download_finished = pyqtSignal(bool, str, str)
 
-    def __init__(self, manifest, target_dir: str, app_name: str):
+    def __init__(self, manifest, target_dir: str, app_name: str, messages: dict[str, str] | None = None):
         super().__init__()
         self.manifest = manifest
         self.target_dir = target_dir
         self.app_name = app_name
         self._cancelled = False
+        self.messages = messages or {}
 
     def cancel(self):
         self._cancelled = True
@@ -1098,14 +1177,14 @@ class UpdateDownloadThread(QThread):
                 cancel_callback=lambda: self._cancelled,
             )
             if self._cancelled:
-                self.download_finished.emit(False, "", "Download cancelled")
+                self.download_finished.emit(False, "", self.messages.get("cancelled", "Đã hủy tải cập nhật"))
                 return
             if not verify_sha256(package_path, self.manifest.sha256):
-                self.download_finished.emit(False, "", "SHA256 verification failed")
+                self.download_finished.emit(False, "", self.messages.get("sha_failed", "Xác minh SHA256 thất bại"))
                 return
-            self.download_finished.emit(True, str(package_path), "Download verified")
+            self.download_finished.emit(True, str(package_path), self.messages.get("verified", "Đã xác minh tải cập nhật"))
         except DownloadCancelled as exc:
-            self.download_finished.emit(False, "", str(exc))
+            self.download_finished.emit(False, "", self.messages.get("cancelled", str(exc) or "Đã hủy tải cập nhật"))
         except Exception as exc:
             self.download_finished.emit(False, "", clean_log_text(exc))
 
@@ -1149,7 +1228,7 @@ class MainWindow(QMainWindow):
         self.settings = AppSettings(output_dir=self.get_default_download_dir())
         self.pending_queue: deque[DownloadTask] = deque()
         self.active_threads: dict[str, tuple[QThread, DownloadWorker]] = {}
-        self.queue_widgets: dict[str, QueueItemWidget] = {}
+        self.queue_rows: dict[str, QueueRowState] = {}
         self.force_stop_timers: dict[str, QTimer] = {}
         self.sidebar_buttons: list[QPushButton] = []
         self.update_thread: UpdateThread | None = None
@@ -1160,29 +1239,36 @@ class MainWindow(QMainWindow):
         self.downloaded_update_package = ""
         self.skipped_update_version = ""
         self.update_prompted_version = ""
+        self.notifications: NotificationManager | None = None
+        self.runtime_status_timer: QTimer | None = None
+        self.network_state_text = "Unknown"
+        self.connection_chip_text = "Sẵn sàng"
+        self.connection_chip_state = "ok"
 
-        self.setWindowTitle("yt-dlp Queue Downloader")
+        self.setWindowTitle("DLP Master")
         self.resize(1280, 780)
         self.setMinimumSize(1040, 680)
         self._build_ui()
         self._apply_theme()
+        self._refresh_runtime_status()
+        self._start_runtime_status_timer()
 
-        self.append_log("success", "[hệ thống] Dashboard sẵn sàng.")
+        self.append_log("success", "Bảng điều khiển đã sẵn sàng.")
         if FFMPEG_PATH:
-            self.append_log("success", f"[system] ffmpeg: {FFMPEG_PATH}")
+            self.append_log("success", "Đã tìm thấy FFmpeg: {path}".format(path=FFMPEG_PATH))
         else:
-            self.append_log("warning", "[hệ thống] Không tìm thấy ffmpeg. Các chế độ chuyển định dạng video/audio sẽ thất bại.")
+            self.append_log("warning", "Không tìm thấy FFmpeg. Các chế độ chuyển đổi video/âm thanh có thể thất bại.")
 
         if WEBENGINE_AVAILABLE:
-            self.append_log("info", "[hệ thống] Qt WebEngine sẵn sàng cho đăng nhập nhúng.")
+            self.append_log("info", "Qt WebEngine đã sẵn sàng.")
         else:
-            self.append_log("warning", "[hệ thống] Chưa có Qt WebEngine. Cài PyQt6-WebEngine để dùng đăng nhập nhúng.")
-        self.append_log("info", f"[hệ thống] Phiên bản ứng dụng: v{self.current_version}")
-        self.append_log("info", f"[hệ thống] Thư mục lưu mặc định: {self.settings.output_dir}")
+            self.append_log("warning", "Qt WebEngine chưa sẵn sàng. Cài PyQt6-WebEngine để dùng đăng nhập nhúng.")
+        self.append_log("info", "Phiên bản ứng dụng: v{version}".format(version=self.current_version))
+        self.append_log("info", "Thư mục lưu mặc định: {path}".format(path=self.settings.output_dir))
         self.update_cookie_status()
         QTimer.singleShot(1500, self.check_for_updates_silent)
         if self.is_frozen_build:
-            self.append_log("info", "[system] Bo qua auto-cap nhat yt-dlp bang pip trong ban dong goi (.exe).")
+            self.append_log("info", "Bỏ qua cập nhật lõi vì đang chạy bản đóng gói.")
         else:
             self.check_core_update()
 
@@ -1197,8 +1283,14 @@ class MainWindow(QMainWindow):
             return
         if self.update_thread and self.update_thread.isRunning():
             return
-        self.append_log("info", "[system] Dang kiem tra va nang cap yt-dlp trong nen...")
-        self.update_thread = UpdateThread()
+        self.append_log("info", "Đang kiểm tra và cập nhật lõi yt-dlp trong nền...")
+        self.update_thread = UpdateThread(
+            {
+                "success": "yt-dlp đã được cập nhật thành công.",
+                "pip_error": "pip kết thúc với mã lỗi {code}.",
+                "exception": "Lỗi khi cập nhật yt-dlp: {error}",
+            }
+        )
         self.update_thread.update_finished.connect(self.on_update_completed)
         self.update_thread.finished.connect(self._clear_update_thread)
         self.update_thread.finished.connect(self.update_thread.deleteLater)
@@ -1206,7 +1298,7 @@ class MainWindow(QMainWindow):
 
     def on_update_completed(self, success, message):
         level = "success" if success else "warning"
-        prefix = "[system] Cap nhat yt-dlp hoan tat" if success else "[system] Cap nhat yt-dlp that bai"
+        prefix = "Cập nhật lõi yt-dlp hoàn tất" if success else "Cập nhật lõi yt-dlp thất bại"
         if hasattr(self, "append_log"):
             self.append_log(level, f"{prefix}: {message}")
         else:
@@ -1221,39 +1313,10 @@ class MainWindow(QMainWindow):
         main_layout.setContentsMargins(14, 14, 14, 14)
         main_layout.setSpacing(12)
 
-        sidebar = QFrame()
-        sidebar.setObjectName("Sidebar")
-        sidebar.setFixedWidth(230)
-        sidebar_layout = QVBoxLayout(sidebar)
-        sidebar_layout.setContentsMargins(12, 14, 12, 14)
-        sidebar_layout.setSpacing(8)
-
-        sidebar_title = QLabel("⚡ DLPMaster")
-        sidebar_title.setObjectName("SidebarTitle")
-        sidebar_layout.addWidget(sidebar_title)
-
-        self.btn_download_page = QPushButton("📥 Tiến trình tải")
-        self.btn_settings_page = QPushButton("⚙️ Cấu hình & Cookie")
-        self.btn_logs_page = QPushButton("📄 Nhật ký hệ thống")
-        self.btn_help_page = QPushButton("❓ Hướng dẫn sử dụng")
-        self.sidebar_buttons = [
-            self.btn_download_page,
-            self.btn_settings_page,
-            self.btn_logs_page,
-            self.btn_help_page,
-        ]
-        for index, button in enumerate(self.sidebar_buttons):
-            button.setCheckable(True)
-            button.setObjectName("SidebarButton")
-            button.clicked.connect(lambda _checked, idx=index: self.switch_page(idx))
-            sidebar_layout.addWidget(button)
-
-        sidebar_layout.addSpacing(10)
-        self.sidebar_login_button = QPushButton("🔑 Đăng nhập tài khoản")
-        self.sidebar_login_button.setObjectName("SidebarActionButton")
-        self.sidebar_login_button.clicked.connect(self.open_login_dialog)
-        sidebar_layout.addWidget(self.sidebar_login_button)
-        sidebar_layout.addStretch(1)
+        self.sidebar = AppSidebar(CONFIG_APP_NAME, self.current_version)
+        self.sidebar.page_requested.connect(self.switch_page)
+        self.sidebar.login_requested.connect(self.open_login_dialog)
+        self.sidebar_buttons = self.sidebar.buttons
 
         self.stack = QStackedWidget()
         self.stack.setObjectName("ContentStack")
@@ -1262,10 +1325,21 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self._build_logs_page())
         self.stack.addWidget(self._build_help_page())
 
-        main_layout.addWidget(sidebar)
-        main_layout.addWidget(self.stack, 1)
+        content_column = QVBoxLayout()
+        content_column.setContentsMargins(0, 0, 0, 0)
+        content_column.setSpacing(10)
+
+        self.top_header = AppHeader(CONFIG_APP_NAME, self.current_version)
+        self.bottom_status = AppStatusBar()
+        content_column.addWidget(self.top_header)
+        content_column.addWidget(self.stack, 1)
+        content_column.addWidget(self.bottom_status)
+
+        main_layout.addWidget(self.sidebar)
+        main_layout.addLayout(content_column, 1)
 
         self.setCentralWidget(root)
+        self.notifications = NotificationManager(self)
         self.switch_page(0)
 
     def _build_content_card(self, title_text: str) -> tuple[QWidget, QVBoxLayout]:
@@ -1274,167 +1348,165 @@ class MainWindow(QMainWindow):
         page_layout.setContentsMargins(0, 0, 0, 0)
         page_layout.setSpacing(0)
 
-        card = QFrame()
-        card.setObjectName("ContentCard")
-        card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(16, 16, 16, 16)
-        card_layout.setSpacing(12)
-
-        title = QLabel(title_text)
-        title.setObjectName("SectionTitle")
-        card_layout.addWidget(title)
+        card = CardFrame(title_text)
+        card_layout = card.body_layout()
 
         page_layout.addWidget(card)
         return page, card_layout
 
     def _build_download_page(self) -> QWidget:
-        page, layout = self._build_content_card("Tiến trình tải")
+        page, layout = self._build_content_card("Tải xuống")
 
-        url_row = QHBoxLayout()
-        url_row.setSpacing(10)
+        self.download_card = DownloadCard()
+        self.url_input = self.download_card.url_input
+        self.download_button = self.download_card.start_button
+        self.output_path_input = self.download_card.output_input
+        self.browse_output_button = self.download_card.browse_button
 
-        self.url_input = QLineEdit()
-        self.url_input.setPlaceholderText("Dán một hoặc nhiều URL (mỗi dòng một link)")
-        self.url_input.setMinimumHeight(42)
         self.url_input.returnPressed.connect(self.enqueue_from_input)
-
-        self.download_button = QPushButton("BẮT ĐẦU TẢI")
-        self.download_button.setObjectName("StartButton")
-        self.download_button.setMinimumHeight(42)
         self.download_button.clicked.connect(self.enqueue_from_input)
+        self.browse_output_button.clicked.connect(self.choose_download_directory)
 
-        url_row.addWidget(self.url_input, 1)
-        url_row.addWidget(self.download_button)
+        self.queue_table = QueueTable()
+        self.queue_table.pause_requested.connect(self.pause_selected_task)
+        self.queue_table.resume_requested.connect(self.resume_selected_task)
+        self.queue_table.retry_requested.connect(self.retry_selected_task)
+        self.queue_table.delete_requested.connect(self.delete_selected_task)
 
-        queue_container = QFrame()
-        queue_container.setObjectName("QueueContainer")
-        queue_layout = QVBoxLayout(queue_container)
-        queue_layout.setContentsMargins(12, 12, 12, 12)
-        queue_layout.setSpacing(10)
+        self.download_card.pause_button.clicked.connect(lambda: self.pause_selected_task(self.queue_table.selected_task_id()))
+        self.download_card.resume_button.clicked.connect(lambda: self.resume_selected_task(self.queue_table.selected_task_id()))
+        self.download_card.retry_button.clicked.connect(lambda: self.retry_selected_task(self.queue_table.selected_task_id()))
+        self.download_card.delete_button.clicked.connect(lambda: self.delete_selected_task(self.queue_table.selected_task_id()))
 
-        queue_header = QHBoxLayout()
-        queue_title = QLabel("Hàng đợi tải")
-        queue_title.setObjectName("SectionTitle")
+        queue_host_layout = QVBoxLayout(self.download_card.queue_placeholder)
+        queue_host_layout.setContentsMargins(0, 0, 0, 0)
+        queue_host_layout.setSpacing(8)
 
+        queue_action_row = QHBoxLayout()
         self.stop_all_button = QPushButton("Dừng tất cả")
         self.stop_all_button.setObjectName("QueueDangerButton")
+        self.stop_all_button.setToolTip("Dừng tất cả tác vụ đang chờ và đang tải.")
         self.stop_all_button.clicked.connect(self.stop_all_tasks)
 
-        self.clear_completed_button = QPushButton("Xóa danh sách")
-        self.clear_completed_button.setObjectName("QueueActionButton")
+        self.clear_completed_button = QPushButton("Xóa đã hoàn thành")
+        self.clear_completed_button.setToolTip("Xóa các tác vụ đã hoàn thành, thất bại hoặc đã dừng.")
         self.clear_completed_button.clicked.connect(self.clear_completed_items)
 
-        queue_header.addWidget(queue_title)
-        queue_header.addStretch(1)
-        queue_header.addWidget(self.stop_all_button)
-        queue_header.addWidget(self.clear_completed_button)
+        queue_action_row.addStretch(1)
+        queue_action_row.addWidget(self.clear_completed_button)
+        queue_action_row.addWidget(self.stop_all_button)
 
-        self.queue_scroll = QScrollArea()
-        self.queue_scroll.setWidgetResizable(True)
-        self.queue_scroll.setObjectName("QueueScroll")
-        self.queue_holder = QWidget()
-        self.queue_items_layout = QVBoxLayout(self.queue_holder)
-        self.queue_items_layout.setContentsMargins(2, 2, 2, 2)
-        self.queue_items_layout.setSpacing(8)
-        self.queue_items_layout.addStretch(1)
-        self.queue_scroll.setWidget(self.queue_holder)
+        queue_host_layout.addLayout(queue_action_row)
+        queue_host_layout.addWidget(self.queue_table, 1)
 
-        queue_layout.addLayout(queue_header)
-        queue_layout.addWidget(self.queue_scroll, 1)
-
-        layout.addLayout(url_row)
-        layout.addWidget(queue_container, 1)
+        self.output_path_input.setText(self.settings.output_dir)
+        layout.addWidget(self.download_card, 1)
         return page
 
     def _build_settings_page(self) -> QWidget:
-        page, layout = self._build_content_card("Cấu hình & Cookie")
+        page, layout = self._build_content_card("Cài đặt")
 
-        row1 = QHBoxLayout()
-        row1.setSpacing(10)
+        grid_host = QWidget()
+        grid = QGridLayout(grid_host)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(12)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+
+        download_card = SettingsCard("Thiết lập tải xuống")
+        download_layout = download_card.content_layout()
+        format_row = QHBoxLayout()
         format_label = QLabel("Định dạng")
-        format_label.setObjectName("Hint")
         self.format_combo = QComboBox()
         self.format_combo.addItems(["MP4", "MP4 (Convert)", "MKV", "MP3", "FLAC"])
         self.format_combo.setCurrentText(self.settings.output_format)
-        row1.addWidget(format_label)
-        row1.addWidget(self.format_combo, 1)
+        format_row.addWidget(format_label)
+        format_row.addWidget(self.format_combo, 1)
 
-        self.embed_subs = QCheckBox("Tự động nhúng phụ đề")
-        self.embed_subs.setChecked(self.settings.embed_subs_checkbox)
-        self.embed_thumb = QCheckBox("Nhúng thumbnail vào file")
-        self.embed_thumb.setChecked(self.settings.embed_thumbnail)
-        self.sponsorblock = QCheckBox("Cắt quảng cáo với SponsorBlock")
-        self.sponsorblock.setChecked(self.settings.sponsorblock)
+        self.write_subs_checkbox = QCheckBox("Phụ đề")
+        self.write_subs_checkbox.setChecked(self.settings.write_subs)
+        self.embed_subs_checkbox = QCheckBox("Nhúng phụ đề")
+        self.embed_subs_checkbox.setChecked(self.settings.embed_subs_checkbox)
+        self.embed_thumb_checkbox = QCheckBox("Ảnh đại diện")
+        self.embed_thumb_checkbox.setChecked(self.settings.embed_thumbnail)
+        self.sponsorblock_checkbox = QCheckBox("Loại bỏ quảng cáo SponsorBlock")
+        self.sponsorblock_checkbox.setChecked(self.settings.sponsorblock)
 
-        folder_row = QHBoxLayout()
-        folder_label = QLabel("Thư mục lưu:")
-        folder_label.setObjectName("Hint")
+        download_layout.addLayout(format_row)
+        download_layout.addWidget(self.write_subs_checkbox)
+        download_layout.addWidget(self.embed_subs_checkbox)
+        download_layout.addWidget(self.embed_thumb_checkbox)
+        download_layout.addWidget(self.sponsorblock_checkbox)
+        download_layout.addStretch(1)
+
+        self.update_card = UpdateCard()
+        self.update_info_label = self.update_card.current_label
+        self.latest_version_label = self.update_card.latest_label
+        self.update_status_label = self.update_card.status_label
+        self.release_notes_view = self.update_card.notes
+        self.check_update_button = self.update_card.check_button
+        self.install_update_button = self.update_card.install_button
+        self.update_progress_bar = self.update_card.progress
+        self.update_progress_meta = self.update_card.progress_meta
+        self.update_channel_combo = self.update_card.channel_combo
+        self.update_channel_combo.setCurrentText(self.update_channel if self.update_channel in {"stable", "beta", "nightly"} else "stable")
+        self.update_channel_combo.currentTextChanged.connect(self.set_update_channel)
+        self.check_update_button.clicked.connect(lambda: self.check_for_updates(manual=True))
+        self.install_update_button.clicked.connect(self.install_downloaded_update)
+        self.update_info_label.setText(f"Phiên bản hiện tại: v{self.current_version}")
+        self.latest_version_label.setText("Phiên bản mới nhất: -")
+        self.update_status_label.setText("Trạng thái: -")
+
+        storage_card = SettingsCard("Lưu trữ")
+        storage_layout = storage_card.content_layout()
+        storage_row = QHBoxLayout()
         self.download_dir_input = QLineEdit(self.settings.output_dir)
         self.download_dir_input.setReadOnly(True)
         self.download_dir_input.setObjectName("ReadOnlyField")
-        self.change_dir_button = QPushButton("Thay đổi...")
-        self.change_dir_button.setObjectName("SettingsButton")
+        self.change_dir_button = QPushButton("Chọn thư mục")
+        self.change_dir_button.setToolTip("Chọn thư mục lưu mặc định cho video và âm thanh.")
         self.change_dir_button.clicked.connect(self.choose_download_directory)
-        folder_row.addWidget(folder_label)
-        folder_row.addWidget(self.download_dir_input, 1)
-        folder_row.addWidget(self.change_dir_button)
+        self.open_dir_button = QPushButton("Mở thư mục")
+        self.open_dir_button.setToolTip("Mở thư mục lưu hiện tại trong trình quản lý tệp.")
+        self.open_dir_button.clicked.connect(self.open_output_directory)
+        storage_row.addWidget(self.download_dir_input, 1)
+        storage_row.addWidget(self.change_dir_button)
+        storage_row.addWidget(self.open_dir_button)
+        self.disk_space_label = QLabel("Dung lượng đĩa: -")
+        self.disk_space_label.setWordWrap(True)
+        storage_layout.addLayout(storage_row)
+        storage_layout.addWidget(self.disk_space_label)
+        storage_layout.addStretch(1)
 
-        self.cookie_status = QLabel()
-        self.cookie_status.setObjectName("Hint")
+        cookie_card = SettingsCard("Cookie")
+        cookie_layout = cookie_card.content_layout()
+        self.cookie_mode_label = QLabel("Chế độ hiện tại: Ẩn danh")
+        self.cookie_status = QLabel("Trạng thái đăng nhập: Chưa đăng nhập")
         self.cookie_status.setWordWrap(True)
+        cookie_buttons = QHBoxLayout()
+        self.cookie_login_button = QPushButton("Đăng nhập")
+        self.cookie_login_button.setToolTip("Mở cửa sổ đăng nhập để lấy cookie tài khoản.")
+        self.cookie_login_button.clicked.connect(self.open_login_dialog)
+        self.cookie_logout_button = QPushButton("Đăng xuất")
+        self.cookie_logout_button.setToolTip("Xóa cookie hiện tại và chuyển về chế độ ẩn danh.")
+        self.cookie_logout_button.clicked.connect(self.logout_cookie)
+        cookie_buttons.addWidget(self.cookie_login_button)
+        cookie_buttons.addWidget(self.cookie_logout_button)
+        cookie_buttons.addStretch(1)
+        cookie_layout.addWidget(self.cookie_mode_label)
+        cookie_layout.addWidget(self.cookie_status)
+        cookie_layout.addLayout(cookie_buttons)
+        cookie_layout.addStretch(1)
 
-        self.write_subs_checkbox = QCheckBox("Tải xuống phụ đề")
-        self.write_subs_checkbox.setChecked(self.settings.write_subs)
+        grid.addWidget(download_card, 0, 0)
+        grid.addWidget(self.update_card, 0, 1)
+        grid.addWidget(storage_card, 1, 0)
+        grid.addWidget(cookie_card, 1, 1)
 
-        self.embed_subs_checkbox = QCheckBox("Nhúng phụ đề vào video")
-        self.embed_subs_checkbox.setChecked(self.settings.embed_subs_checkbox)
-
-        self.embed_thumb_checkbox = QCheckBox("Nhúng thumbnail vào file")
-        self.embed_thumb_checkbox.setChecked(self.settings.embed_thumbnail)
-
-        self.sponsorblock_checkbox = QCheckBox("Cắt quảng cáo với SponsorBlock")
-        self.sponsorblock_checkbox.setChecked(self.settings.sponsorblock)
-
-        channel_row = QHBoxLayout()
-        channel_label = QLabel("Update Channel")
-        channel_label.setObjectName("Hint")
-        self.update_channel_combo = QComboBox()
-        self.update_channel_combo.addItems(["stable", "beta", "nightly"])
-        self.update_channel_combo.setCurrentText(self.update_channel if self.update_channel in {"stable", "beta", "nightly"} else "stable")
-        self.update_channel_combo.currentTextChanged.connect(self.set_update_channel)
-        channel_row.addWidget(channel_label)
-        channel_row.addWidget(self.update_channel_combo, 1)
-
-        update_row = QHBoxLayout()
-        self.update_info_label = QLabel(f"Phiên bản hiện tại: v{self.current_version}")
-        self.update_info_label.setObjectName("Hint")
-        self.latest_version_label = QLabel("Latest Version: -")
-        self.latest_version_label.setObjectName("Hint")
-        self.check_update_button = QPushButton("Kiểm tra cập nhật")
-        self.check_update_button.setObjectName("SettingsButton")
-        self.check_update_button.clicked.connect(lambda: self.check_for_updates(manual=True))
-        update_row.addWidget(self.update_info_label)
-        update_row.addWidget(self.latest_version_label)
-        update_row.addStretch(1)
-        update_row.addWidget(self.check_update_button)
-
-        self.release_notes_view = QTextBrowser()
-        self.release_notes_view.setObjectName("HelpBrowser")
-        self.release_notes_view.setReadOnly(True)
-        self.release_notes_view.setMaximumHeight(120)
-        self.release_notes_view.setPlainText("Release Notes: -")
-
-        layout.addLayout(row1)
-        layout.addWidget(self.write_subs_checkbox)
-        layout.addWidget(self.embed_subs_checkbox)
-        layout.addWidget(self.embed_thumb_checkbox)
-        layout.addWidget(self.sponsorblock_checkbox)
-        layout.addLayout(channel_row)
-        layout.addLayout(update_row)
-        layout.addWidget(self.release_notes_view)
-        layout.addLayout(folder_row)
-        layout.addWidget(self.cookie_status)
-        layout.addStretch(1)
+        layout.addWidget(grid_host, 1)
+        self.refresh_storage_status()
+        self.update_cookie_status()
 
         return page
 
@@ -1443,7 +1515,7 @@ class MainWindow(QMainWindow):
 
         header = QHBoxLayout()
         header.addStretch(1)
-        self.clear_button = QPushButton("Xóa log")
+        self.clear_button = QPushButton("Xóa nhật ký")
         self.clear_button.setObjectName("ClearButton")
         self.clear_button.clicked.connect(self.clear_log)
         header.addWidget(self.clear_button)
@@ -1463,91 +1535,28 @@ class MainWindow(QMainWindow):
         self.help_text.setObjectName("HelpBrowser")
         self.help_text.setOpenExternalLinks(True)
         self.help_text.setHtml(
-            f"""
-            <div>
-                <h2 style='font-size:18px; color:#58a6ff; margin:0 0 14px 0;'>HƯỚNG DẪN SỬ DỤNG DLP-Master</h2>
-
-                <h3 style='font-size:14px; color:#eac54f; margin:14px 0 8px 0; font-weight:700;'>1) TỔNG QUAN GIAO DIỆN</h3>
-                <ul style='color:#c9d1d9; line-height:1.7; margin:0 0 8px 18px;'>
-                    <li><b>Tiến trình tải</b>: dán link, bắt đầu tải, theo dõi tiến độ và trạng thái từng video.</li>
-                    <li><b>Cấu hình &amp; Cookie</b>: chọn định dạng xuất, phụ đề, thumbnail, SponsorBlock, thư mục lưu và kiểm tra cập nhật ứng dụng.</li>
-                    <li><b>Nhật ký hệ thống</b>: xem log chi tiết của yt-dlp, ffmpeg, cookie, cập nhật và lỗi phát sinh.</li>
-                    <li><b>Hướng dẫn sử dụng</b>: xem quy trình thao tác và cách xử lý lỗi thường gặp.</li>
-                </ul>
-
-                <h3 style='font-size:14px; color:#eac54f; margin:14px 0 8px 0; font-weight:700;'>2) THIẾT LẬP TRƯỚC KHI TẢI</h3>
-                <ul style='color:#c9d1d9; line-height:1.7; margin:0 0 8px 18px;'>
-                    <li>Vào <b>Cấu hình &amp; Cookie</b>, chọn <b>Định dạng</b>: MP4, MP4 (Convert), MKV, MP3 hoặc FLAC.</li>
-                    <li>Bấm <b>Thay đổi...</b> để chọn thư mục lưu. Mặc định là thư mục Downloads của Windows nếu có.</li>
-                    <li>Bật <b>Tải xuống phụ đề</b> nếu muốn lưu phụ đề riêng; bật <b>Nhúng phụ đề vào video</b> nếu muốn gắn phụ đề vào file video.</li>
-                    <li>Bật <b>Nhúng thumbnail vào file</b> để gắn ảnh bìa, hoặc <b>Cắt quảng cáo với SponsorBlock</b> nếu nguồn hỗ trợ.</li>
-                </ul>
-
-                <h3 style='font-size:14px; color:#eac54f; margin:14px 0 8px 0; font-weight:700;'>3) TẢI VIDEO, PLAYLIST HOẶC NHIỀU LINK</h3>
-                <ul style='color:#c9d1d9; line-height:1.7; margin:0 0 8px 18px;'>
-                    <li>Vào <b>Tiến trình tải</b>, dán một URL hoặc nhiều URL, mỗi link một dòng.</li>
-                    <li>Bấm <b>BẮT ĐẦU TẢI</b>. Mỗi link sẽ được thêm vào <b>Hàng đợi tải</b> với mã task riêng.</li>
-                    <li>Ứng dụng tải tối đa <b>{MAX_CONCURRENT_DOWNLOADS} task cùng lúc</b>; các link còn lại tự động chờ đến lượt.</li>
-                    <li>Với playlist/kênh, app dùng chế độ <b>lazy playlist</b> để vừa đọc danh sách vừa tải, giúp tránh đứng giao diện quá lâu.</li>
-                    <li>Thanh tiến độ hiển thị phần trăm, dung lượng và trạng thái: đang chờ, đang tải, hoàn tất, thất bại hoặc đã dừng.</li>
-                </ul>
-
-                <h3 style='font-size:14px; color:#eac54f; margin:14px 0 8px 0; font-weight:700;'>4) ĐIỀU KHIỂN HÀNG ĐỢI</h3>
-                <ul style='color:#c9d1d9; line-height:1.7; margin:0 0 8px 18px;'>
-                    <li><b>Dừng tất cả</b>: hủy các task đang chờ và gửi lệnh dừng đến các task đang tải.</li>
-                    <li><b>Xóa danh sách</b>: chỉ xóa các mục đã hoàn tất, thất bại hoặc đã dừng; task đang tải sẽ được giữ lại.</li>
-                    <li>Nếu task bị lỗi, xem thông tin ngắn ngay trên item và xem chi tiết trong <b>Nhật ký hệ thống</b>.</li>
-                </ul>
-
-                <div style='border:1px solid #2f3f57; border-radius:10px; background:#121c2c; padding:12px 14px; margin:12px 0;'>
-                    <div style='color:#58a6ff; font-weight:700; margin-bottom:6px;'>Lưu ý về ffmpeg</div>
-                    <div style='color:#c9d1d9; line-height:1.7;'>
-                        Các chế độ MP4, MP4 (Convert), MKV, MP3, FLAC, nhúng phụ đề, nhúng thumbnail và SponsorBlock cần ffmpeg.
-                        Nếu ứng dụng báo thiếu ffmpeg, hãy cài ffmpeg vào PATH hoặc đặt trong thư mục tools/ffmpeg/bin của app.
-                    </div>
-                </div>
-
-                <h3 style='font-size:14px; color:#eac54f; margin:14px 0 8px 0; font-weight:700;'>5) ĐĂNG NHẬP COOKIE CHO VIDEO GIỚI HẠN</h3>
-                <ul style='color:#c9d1d9; line-height:1.7; margin:0 0 8px 18px;'>
-                    <li>Bấm <b>Đăng nhập tài khoản</b> ở thanh bên trái để mở cửa sổ đăng nhập nhúng.</li>
-                    <li>Chọn nền tảng: TikTok, YouTube, Facebook, Douyin hoặc Kuaishou, rồi đăng nhập trong trình duyệt nhúng.</li>
-                    <li>Sau khi đăng nhập thành công, bấm <b>Tôi đã đăng nhập xong - Lưu cookie</b> hoặc đóng cửa sổ để app lưu cookie tạm.</li>
-                    <li>Cookie đang sử dụng sẽ hiện trong tab <b>Cấu hình &amp; Cookie</b>. Cookie tạm được dọn dẹp khi đóng ứng dụng.</li>
-                </ul>
-
-                <h3 style='font-size:14px; color:#eac54f; margin:14px 0 8px 0; font-weight:700;'>6) CẬP NHẬT VÀ NHẬT KÝ</h3>
-                <ul style='color:#c9d1d9; line-height:1.7; margin:0 0 8px 18px;'>
-                    <li>Khi mở app, DLP-Master tự chạy nền lệnh nâng cấp lõi <b>yt-dlp</b>; kết quả sẽ hiện trong log.</li>
-                    <li>Nút <b>Kiểm tra cập nhật</b> dùng để kiểm tra phiên bản ứng dụng nếu đã cấu hình UPDATE_URL trong app_config.py.</li>
-                    <li>Tab <b>Nhật ký hệ thống</b> hiển thị log tải, lỗi 429, lỗi cookie, ffmpeg, cập nhật yt-dlp và cập nhật ứng dụng.</li>
-                    <li>Bấm <b>Xóa log</b> để làm sạch màn hình log, không ảnh hưởng đến task đang tải.</li>
-                </ul>
-
-                <h3 style='font-size:14px; color:#eac54f; margin:14px 0 8px 0; font-weight:700;'>7) XỬ LÝ LỖI THƯỜNG GẶP</h3>
-                <ul style='color:#c9d1d9; line-height:1.7; margin:0 0 8px 18px;'>
-                    <li><b>Thiếu URL</b>: dán link vào ô nhập, mỗi link một dòng nếu tải nhiều video.</li>
-                    <li><b>Thiếu ffmpeg</b>: cài ffmpeg hoặc chọn lại cấu hình không cần xử lý media nếu phù hợp.</li>
-                    <li><b>HTTP 429 / Too Many Requests</b>: tạm dừng một lúc rồi thử lại; đăng nhập cookie thường giúp ổn định hơn.</li>
-                    <li><b>Video giới hạn hoặc yêu cầu đăng nhập</b>: dùng nút <b>Đăng nhập tài khoản</b> để lấy cookie trước khi tải.</li>
-                    <li><b>Tên file quá dài/ký tự lạ</b>: app đã giới hạn tiêu đề và bật chế độ tên file thân thiện với Windows.</li>
-                </ul>
-
-                <div style='border:1px solid #2f3f57; border-radius:10px; background:#101926; padding:12px 14px; margin:12px 0;'>
-                    <div style='color:#58a6ff; font-weight:700; margin-bottom:6px;'>Quy trình khuyến nghị</div>
-                    <div style='color:#c9d1d9; line-height:1.7;'>
-                        Chọn thư mục lưu -> chọn định dạng -> đăng nhập cookie nếu cần -> dán URL -> BẮT ĐẦU TẢI -> theo dõi hàng đợi và log.
-                    </div>
-                </div>
-
-                <hr style="border: 0; border-top: 1px solid #30363d; margin-top: 30px; margin-bottom: 15px;"/>
-                <div style='font-size:12px; color:#8b949e; line-height:1.7;'>
-                    <p><strong>✍️ Tác giả:</strong> TH89</p>
-                    <p><strong>📧 Email:</strong> <a href="mailto:Thienhash@gmail.com" style="color: #58a6ff; text-decoration: none;">Thienhash@gmail.com</a></p>
-                    <p><strong>🌐 Facebook:</strong> <a href="https://www.facebook.com/nhu.inh.ha" style="color: #58a6ff; text-decoration: none;">nhu.inh.ha</a></p>
-                    <p style="margin-top: 15px; font-size: 11px; color: #6e7681;">📦 Mã nguồn mở: <strong>yt-dlp core</strong> | Phiên bản: <span style="color: #238636;">v{VERSION}</span></p>
-                </div>
-            </div>
-            """
+            (
+                "<div><h2 style='font-size:18px; color:#58a6ff; margin:0 0 14px 0;'>"
+                "HƯỚNG DẪN SỬ DỤNG DLP Master</h2>"
+                "<p style='color:#c9d1d9; line-height:1.7;'>DLP Master hỗ trợ tải video, âm thanh "
+                "và playlist với hàng đợi thông minh. Ứng dụng đang chạy tối đa <b>{max_tasks}</b> "
+                "tác vụ cùng lúc.</p>"
+                "<ul style='color:#c9d1d9; line-height:1.7; margin:8px 0 8px 18px;'>"
+                "<li>Vào tab <b>Tải xuống</b>, dán URL và nhấn <b>Bắt đầu tải</b>.</li>"
+                "<li>Trong tab <b>Cài đặt</b>, chọn định dạng, thư mục lưu và kiểm tra cập nhật.</li>"
+                "<li>Dùng <b>Đăng nhập tài khoản</b> để lấy cookie cho nội dung giới hạn.</li>"
+                "<li>Tab <b>Nhật ký</b> hiển thị chi tiết lỗi và tiến trình xử lý.</li>"
+                "</ul>"
+                "<div style='border:1px solid #2f3f57; border-radius:10px; background:#121c2c; "
+                "padding:12px 14px; margin:12px 0; color:#c9d1d9; line-height:1.7;'>"
+                "<b>Lưu ý:</b> FFmpeg là bắt buộc cho chuyển đổi định dạng, nhúng phụ đề/thumbnail "
+                "và SponsorBlock.</div>"
+                "<p style='font-size:12px; color:#8b949e; margin-top:14px;'>"
+                "Phiên bản hiện tại: <b>v{version}</b></p></div>"
+            ).format(
+                max_tasks=MAX_CONCURRENT_DOWNLOADS,
+                version=VERSION,
+            )
         )
 
         layout.addWidget(self.help_text, 1)
@@ -1555,198 +1564,115 @@ class MainWindow(QMainWindow):
 
     def switch_page(self, index: int):
         self.stack.setCurrentIndex(index)
-        for idx, button in enumerate(self.sidebar_buttons):
-            button.setChecked(idx == index)
+        if hasattr(self, "sidebar"):
+            self.sidebar.set_current(index)
 
     def _apply_theme(self):
-        self.setStyleSheet(
-            """
-            QMainWindow, QWidget {
-                background: #0a0f18;
-                color: #dbe4ee;
-                font-family: "Segoe UI", "Noto Sans", sans-serif;
-                font-size: 14px;
-            }
-            QFrame#Sidebar {
-                background: #010409;
-                border: 1px solid #1f2937;
-                border-radius: 10px;
-            }
-            QLabel#SidebarTitle {
-                color: #58a6ff;
-                font-weight: bold;
-                font-size: 16px;
-                padding-bottom: 10px;
-                margin-bottom: 15px;
-                border-bottom: 1px solid #30363d;
-            }
-            QPushButton#SidebarButton {
-                text-align: left;
-                background: #0f1724;
-                color: #9dd2ff;
-                border: 1px solid #223249;
-                border-radius: 8px;
-                padding: 10px 12px;
-            }
-            QPushButton#SidebarButton:hover {
-                background: #132033;
-                border-color: #2c4768;
-                color: #d7eeff;
-            }
-            QPushButton#SidebarButton:checked {
-                background: #173251;
-                border-color: #4b86c2;
-                color: #e8f5ff;
-            }
-            QPushButton#SidebarActionButton {
-                text-align: left;
-                background: #102132;
-                color: #7cc4ff;
-                border: 1px solid #315274;
-                border-radius: 8px;
-                padding: 10px 12px;
-                font-weight: 600;
-            }
-            QPushButton#SidebarActionButton:hover {
-                background: #173251;
-                border-color: #4b86c2;
-                color: #e8f5ff;
-            }
-            QStackedWidget#ContentStack {
-                background: transparent;
-            }
-            QFrame#ContentCard {
-                border-radius: 8px;
-                border: 1px solid #30363d;
-                background-color: #161b22;
-            }
-            QFrame#QueueContainer {
-                border: 1px solid #253244;
-                border-radius: 10px;
-                background: #0f1622;
-            }
-            QLabel#SectionTitle {
-                color: #f8fbff;
-                font-size: 16px;
-                font-weight: 700;
-            }
-            QLineEdit, QComboBox {
-                background: #08101b;
-                color: #dbe4ee;
-                border: 1px solid #2f3f57;
-                border-radius: 8px;
-                padding: 11px;
-                selection-background-color: #2da6ff;
-            }
-            QLineEdit#ReadOnlyField {
-                background: #0f1724;
-                color: #9fb5cd;
-            }
-            QLineEdit:focus, QComboBox:focus {
-                border-color: #2da6ff;
-            }
-            QPushButton#StartButton {
-                background: #00b86f;
-                color: #03150d;
-                border: 0;
-                border-radius: 8px;
-                font-size: 14px;
-                font-weight: 800;
-                padding: 0 16px;
-            }
-            QPushButton#StartButton:hover {
-                background: #13d181;
-            }
-            QPushButton#SettingsButton, QPushButton#ClearButton, QPushButton#LoginButton, QPushButton#QueueActionButton, QPushButton {
-                background: #101b2a;
-                color: #9dd2ff;
-                border: 1px solid #355171;
-                border-radius: 8px;
-                padding: 8px 12px;
-            }
-            QPushButton#QueueDangerButton {
-                background: #2a1313;
-                color: #ffb4b4;
-                border: 1px solid #8a3b3b;
-                border-radius: 8px;
-                padding: 8px 12px;
-            }
-            QScrollArea#QueueScroll {
-                border: 0;
-                background: transparent;
-            }
-            QFrame#QueueItem {
-                background: #0a1320;
-                border: 1px solid #223249;
-                border-radius: 10px;
-            }
-            QLabel#QueueTitle {
-                color: #dbe4ee;
-                font-size: 13px;
-                font-weight: 600;
-            }
-            QLabel#QueueStatus {
-                color: #94c8ff;
-                font-size: 12px;
-                padding: 2px 8px;
-                background: #122034;
-                border: 1px solid #2d4a6d;
-                border-radius: 9px;
-            }
-            QLabel#QueueStatus[state="done"] {
-                color: #96f5c8;
-                background: #10271d;
-                border: 1px solid #2f8f63;
-            }
-            QLabel#QueueStatus[state="failed"] {
-                color: #ffb9b9;
-                background: #2a1111;
-                border: 1px solid #9b3f3f;
-            }
-            QLabel#QueueStatus[state="cancelled"] {
-                color: #ffd4a8;
-                background: #2a1d10;
-                border: 1px solid #91603b;
-            }
-            QLabel#QueueStatus[state="running"] {
-                color: #9dd2ff;
-                background: #122034;
-                border: 1px solid #2d4a6d;
-            }
-            QProgressBar {
-                border: 1px solid #30435d;
-                border-radius: 6px;
-                background: #0b1220;
-                color: #dbe4ee;
-                text-align: center;
-                height: 11px;
-            }
-            QProgressBar::chunk {
-                border-radius: 6px;
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #2da6ff, stop:1 #00d09c);
-            }
-            QTextEdit#Console {
-                background: #00060f;
-                color: #8df7b2;
-                border: 1px solid #223249;
-                border-radius: 10px;
-                padding: 10px;
-                font-family: Consolas, "Cascadia Mono", monospace;
-                font-size: 12px;
-            }
-            QCheckBox::indicator {
-                width: 18px;
-                height: 18px;
-                border: 1px solid #ffffff;
-                border-radius: 4px;
-                background: #161b22;
-            }
-            QCheckBox::indicator:checked {
-                background: #18FFFF;
-                border: 2px solid #58a6ff;
-            }
-            """
-        )
+        apply_theme(self, "dark")
+
+    def _start_runtime_status_timer(self):
+        self.runtime_status_timer = QTimer(self)
+        self.runtime_status_timer.setInterval(6000)
+        self.runtime_status_timer.timeout.connect(self._poll_runtime_status)
+        self.runtime_status_timer.start()
+        QTimer.singleShot(500, self._poll_runtime_status)
+
+    def _poll_runtime_status(self):
+        self.network_state_text = self._probe_network_state()
+        if self.network_state_text == "Offline":
+            self._set_connection_chip("Mất kết nối", "error")
+        elif self.connection_chip_state == "error":
+            self._set_connection_chip("Sẵn sàng", "ok")
+        self._refresh_runtime_status()
+
+    @staticmethod
+    def _probe_network_state() -> str:
+        try:
+            probe = socket.create_connection(("1.1.1.1", 53), timeout=1.2)
+            probe.close()
+            return "Online"
+        except OSError:
+            return "Offline"
+
+    def _set_connection_chip(self, text: str, state: str):
+        self.connection_chip_text = text
+        self.connection_chip_state = state
+        if hasattr(self, "top_header"):
+            self.top_header.set_connection_status(text, state)
+
+    def notify(self, message: str, level: str = "info"):
+        if self.notifications:
+            self.notifications.show(message, level=level)
+
+    def _refresh_runtime_status(self):
+        if hasattr(self, "bottom_status"):
+            queued_count = len(self.pending_queue) + len(self.active_threads)
+            cookie_ready = bool(self.settings.cookie_file and Path(self.settings.cookie_file).exists())
+            self.bottom_status.set_metrics(queued_count, len(self.active_threads), cookie_ready, self.network_state_text)
+
+        if hasattr(self, "top_header"):
+            ffmpeg_ok = bool(FFMPEG_PATH)
+            self.top_header.set_engine_status(
+                "yt-dlp + FFmpeg" if ffmpeg_ok else "yt-dlp",
+                "ok" if ffmpeg_ok else "warning",
+            )
+            self.top_header.set_connection_status(self.connection_chip_text, self.connection_chip_state)
+
+    def set_update_status(self, state: str):
+        if not hasattr(self, "update_status_label"):
+            return
+        if state == "uptodate":
+            self.update_status_label.setText("Đã là phiên bản mới nhất")
+        elif state == "available":
+            self.update_status_label.setText("Có bản cập nhật")
+        elif state == "failed":
+            self.update_status_label.setText("Không thể cập nhật")
+        else:
+            self.update_status_label.setText("Trạng thái: -")
+
+    def refresh_storage_status(self):
+        if not hasattr(self, "disk_space_label"):
+            return
+        target = self.settings.output_dir.strip() or self.get_default_download_dir()
+        try:
+            usage = shutil.disk_usage(target)
+            free_gb = usage.free / (1024 ** 3)
+            total_gb = usage.total / (1024 ** 3)
+            self.disk_space_label.setText(
+                f"Dung lượng đĩa: {free_gb:.1f} GB trống / {total_gb:.1f} GB tổng"
+            )
+        except Exception:
+            self.disk_space_label.setText(
+                "Dung lượng đĩa: Không thể đọc dung lượng đĩa"
+            )
+
+    def open_output_directory(self):
+        target = self.settings.output_dir.strip()
+        if not target:
+            self.notify("Chưa có thư mục lưu.", "warning")
+            return
+        try:
+            Path(target).mkdir(parents=True, exist_ok=True)
+            if os.name == "nt":
+                os.startfile(target)
+            else:
+                webbrowser.open(target)
+        except Exception as err:
+            self.notify(
+                "Không thể mở thư mục: {error}".format(error=clean_log_text(err)),
+                "error",
+            )
+
+    def logout_cookie(self):
+        cookie_file = self.settings.cookie_file
+        self.settings.cookie_file = ""
+        if cookie_file and Path(cookie_file).exists():
+            try:
+                Path(cookie_file).unlink()
+            except OSError:
+                pass
+        self.update_cookie_status()
+        self.notify("Đã đăng xuất cookie.", "info")
 
     def parse_urls(self, raw: str) -> list[str]:
         normalized = raw.replace(",", "\n")
@@ -1754,39 +1680,76 @@ class MainWindow(QMainWindow):
         return [part for part in parts if part]
 
     def add_queue_item(self, task: DownloadTask):
-        item = QueueItemWidget(task)
-        item.mark_queued()
-        self.queue_widgets[task.task_id] = item
-        self.queue_items_layout.insertWidget(self.queue_items_layout.count() - 1, item)
+        row = QueueRowState(
+            task_id=task.task_id,
+            url=task.url,
+            title=task.url,
+            status="Queued",
+            format_label=self.settings.output_format,
+        )
+        self.queue_rows[task.task_id] = row
+        self.queue_table.add_row(
+            task.task_id,
+            [row.status, row.title, row.progress, row.speed, row.eta, row.size, row.format_label],
+        )
+
+    def _update_queue_row(self, task_id: str):
+        row = self.queue_rows.get(task_id)
+        if not row:
+            return
+        status_map = {
+            "Queued": "Đang chờ",
+            "Running": "Đang tải",
+            "Post-processing": "Đang xử lý",
+            "Done": "Hoàn tất",
+            "Failed": "Thất bại",
+            "Paused": "Đã dừng",
+        }
+        self.queue_table.update_row(
+            task_id,
+            [status_map.get(row.status, row.status), row.title, row.progress, row.speed, row.eta, row.size, row.format_label],
+        )
+
+    @staticmethod
+    def _extract_speed_eta(details: str) -> tuple[str, str]:
+        speed = "-"
+        eta = "-"
+        parts = [part.strip() for part in str(details or "").split("|")]
+        if len(parts) >= 2 and parts[1]:
+            speed = parts[1]
+        if len(parts) >= 3:
+            eta_part = parts[2]
+            if eta_part.lower().startswith("eta"):
+                eta = eta_part.split(" ", 1)[-1].strip() or "-"
+        return speed, eta
 
     def enqueue_from_input(self):
         self.apply_settings_from_controls()
         raw = self.url_input.text().strip()
         if not raw:
-            QMessageBox.warning(self, "Thiếu URL", "Hãy dán URL cần tải.")
+            self.notify("Thiếu URL: Hãy dán URL cần tải.", "warning")
             return
 
         urls = self.parse_urls(raw)
         if not urls:
-            QMessageBox.warning(self, "URL không hợp lệ", "Không tìm thấy URL trong ô nhập.")
+            self.notify("URL không hợp lệ: Không tìm thấy URL trong ô nhập.", "warning")
             return
 
-        output_dir = self.download_dir_input.text().strip()
+        output_dir = self.output_path_input.text().strip()
         if not output_dir:
-            QMessageBox.warning(self, "Thư mục lưu", "Hãy chọn thư mục lưu hợp lệ trước khi tải.")
+            self.notify("Thư mục lưu không hợp lệ. Hãy chọn thư mục trước khi tải.", "warning")
             return
         try:
             Path(output_dir).mkdir(parents=True, exist_ok=True)
         except OSError as err:
-            QMessageBox.critical(self, "Thư mục lưu", f"Không thể tạo/ghi vào thư mục đã chọn:\n{err}")
+            self.notify("Không thể tạo/ghi vào thư mục đã chọn: {error}".format(error=err), "error")
             return
         self.settings.output_dir = output_dir
 
         if not FFMPEG_PATH and self.settings_requires_ffmpeg():
-            QMessageBox.critical(
-                self,
-                "Thiếu ffmpeg",
-                "Cài đặt hiện tại cần ffmpeg để convert/xử lý. Hãy cài ffmpeg vào máy tính hoặc đổi cấu hình định dạng khác.",
+            self.notify(
+                "Thiếu FFmpeg: cấu hình hiện tại cần FFmpeg để chuyển đổi/xử lý media.",
+                "error",
             )
             return
 
@@ -1794,9 +1757,10 @@ class MainWindow(QMainWindow):
             task = DownloadTask(task_id=uuid.uuid4().hex[:8], url=url)
             self.pending_queue.append(task)
             self.add_queue_item(task)
-            self.append_log("info", f"[hàng đợi] Đã thêm {task.task_id}: {url}")
+            self.append_log("info", "[hàng đợi] Đã thêm {task_id}: {url}".format(task_id=task.task_id, url=url))
 
         self.url_input.clear()
+        self._refresh_runtime_status()
         self.pump_queue()
 
     def apply_settings_from_controls(self):
@@ -1819,11 +1783,14 @@ class MainWindow(QMainWindow):
         while self.pending_queue and len(self.active_threads) < MAX_CONCURRENT_DOWNLOADS:
             task = self.pending_queue.popleft()
             self.start_task(task)
+        self._refresh_runtime_status()
 
     def start_task(self, task: DownloadTask):
-        item = self.queue_widgets[task.task_id]
-        item.mark_running()
-        item.meta.setText("Khởi tạo worker...")
+        row = self.queue_rows.get(task.task_id)
+        if row:
+            row.status = "Running"
+            row.details = "Khoi tao worker"
+            self._update_queue_row(task.task_id)
 
         thread = QThread()
         worker = DownloadWorker(task, self.settings)
@@ -1843,38 +1810,47 @@ class MainWindow(QMainWindow):
         thread.finished.connect(thread.deleteLater)
 
         self.active_threads[task.task_id] = (thread, worker)
-        self.append_log("warning", f"[hàng đợi] Bắt đầu task {task.task_id}")
+        self.append_log("warning", "[hàng đợi] Bắt đầu tác vụ {task_id}".format(task_id=task.task_id))
         thread.start()
+        self._refresh_runtime_status()
 
     def handle_task_metadata(self, task_id: str, title: str, size_hint: str):
-        item = self.queue_widgets.get(task_id)
-        if not item:
+        row = self.queue_rows.get(task_id)
+        if not row:
             return
-        item.set_video_title(title)
+        row.title = title
         if size_hint and size_hint != "-":
-            item.last_size = size_hint
-            if item.status.property("state") != "done":
-                item.status.setText(f"{size_hint} | Đang tải")
+            row.size = size_hint
+        self._update_queue_row(task_id)
 
     def handle_task_progress(self, task_id: str, percent: int, size_text: str, details: str):
-        item = self.queue_widgets.get(task_id)
-        if not item:
+        row = self.queue_rows.get(task_id)
+        if not row:
             return
-        item.update_download_state(percent, size_text, details)
+        speed, eta = self._extract_speed_eta(details)
+        row.progress = f"{max(0, min(100, int(percent)))}%"
+        row.speed = speed
+        row.eta = eta
+        row.size = size_text or row.size
+        row.status = "Running" if percent < 100 else "Post-processing"
+        row.details = details
+        self._update_queue_row(task_id)
 
     def handle_task_finished(self, task_id: str, ok: bool, message: str):
-        item = self.queue_widgets.get(task_id)
-        if item:
+        row = self.queue_rows.get(task_id)
+        if row:
             cancelled = "đã dừng bởi người dùng" in clean_log_text(message).lower()
             if ok:
-                item.mark_done()
-                item.meta.setText(f"{item.last_size} | Hoàn tất")
+                row.status = "Done"
+                row.progress = "100%"
+                if row.size == "-":
+                    row.size = row.details.split("|")[0].strip() if row.details and "|" in row.details else row.size
+                row.eta = "00:00"
             elif cancelled:
-                item.mark_cancelled()
-                item.meta.setText("Đã dừng bởi người dùng")
+                row.status = "Paused"
             else:
-                item.mark_failed()
-                item.meta.setText(clean_log_text(message))
+                row.status = "Failed"
+            self._update_queue_row(task_id)
 
         level = "success" if ok else "error"
         prefix = "[done]" if ok else "[failed]"
@@ -1886,30 +1862,46 @@ class MainWindow(QMainWindow):
             timer.stop()
             timer.deleteLater()
         self.active_threads.pop(task_id, None)
+        self._refresh_runtime_status()
         self.pump_queue()
 
     def update_cookie_status(self):
-        if self.settings.cookie_file and Path(self.settings.cookie_file).exists():
-            self.cookie_status.setText(f"Cookie đang sử dụng: {self.settings.cookie_file}")
+        has_cookie = bool(self.settings.cookie_file and Path(self.settings.cookie_file).exists())
+        if has_cookie:
+            self.cookie_status.setText(
+                f"Trạng thái đăng nhập: Đã đăng nhập ({self.settings.cookie_file})"
+            )
+            if hasattr(self, "cookie_mode_label"):
+                self.cookie_mode_label.setText(
+                    "Chế độ hiện tại: Cookie tài khoản"
+                )
         else:
-            self.cookie_status.setText("Cookie mode: Public/Ẩn danh (chưa đăng nhập)")
+            self.cookie_status.setText(
+                "Trạng thái đăng nhập: Chưa đăng nhập"
+            )
+            if hasattr(self, "cookie_mode_label"):
+                self.cookie_mode_label.setText(
+                    "Chế độ hiện tại: Ẩn danh"
+                )
+        self._refresh_runtime_status()
 
     def set_update_channel(self, channel: str):
         self.update_channel = (channel or "stable").strip().lower()
-        self.append_log("info", f"[update] Update channel: {self.update_channel}")
+        self.append_log("info", "[cập nhật] Kênh cập nhật: {channel}".format(channel=self.update_channel))
 
     def check_for_updates_silent(self):
         self.check_for_updates(manual=False)
 
     def check_for_updates(self, manual: bool = False):
         if not self.update_url:
-            self.append_log("warning", "[update] Chưa cấu hình UPDATE_URL trong app_config.py")
+            self.append_log("warning", "[cập nhật] Chưa cấu hình UPDATE_URL trong app_config.py")
+            self.set_update_status("failed")
             return
         if self.update_check_thread and self.update_check_thread.isRunning():
             return
 
         if manual:
-            self.append_log("info", "[update] Đang kiểm tra cập nhật...")
+            self.append_log("info", "[cập nhật] Đang kiểm tra cập nhật...")
         self.check_update_button.setEnabled(False)
         self.update_check_thread = UpdateCheckThread(
             self.update_url,
@@ -1929,31 +1921,45 @@ class MainWindow(QMainWindow):
 
     def on_update_check_completed(self, success: bool, result: UpdateCheckResult | None, message: str, manual: bool):
         if not success or not result:
-            self.append_log("warning", f"[update] Không thể kiểm tra cập nhật: {clean_log_text(message)}")
+            self.append_log("warning", "[cập nhật] Không thể kiểm tra cập nhật: {error}".format(error=clean_log_text(message)))
+            self.set_update_status("failed")
+            if hasattr(self, "top_header"):
+                self._set_connection_chip("Cập nhật thất bại", "error")
             if manual and hasattr(self, "release_notes_view"):
-                self.release_notes_view.setPlainText(f"Update error: {clean_log_text(message)}")
+                self.release_notes_view.setPlainText(
+                    "Lỗi cập nhật: {message}".format(message=clean_log_text(message))
+                )
             return
 
         self.pending_update_result = result
         manifest = result.manifest
         self.latest_release_url = manifest.download_url
         if hasattr(self, "latest_version_label"):
-            self.latest_version_label.setText(f"Latest Version: v{result.latest_version}")
+            self.latest_version_label.setText(f"Phiên bản mới nhất: v{result.latest_version}")
         if hasattr(self, "release_notes_view"):
-            self.release_notes_view.setPlainText(manifest.release_notes or "Release Notes: -")
+            self.release_notes_view.setPlainText(simplify_release_notes(result.latest_version, manifest.release_notes or ""))
 
         if not result.is_supported:
-            self.append_log("warning", f"[update] Phiên bản hiện tại thấp hơn minimum_version v{manifest.minimum_version}.")
+            self.append_log("warning", "[cập nhật] Phiên bản hiện tại thấp hơn minimum_version v{version}.".format(version=manifest.minimum_version))
 
         if result.update_available:
-            self.append_log("warning", f"[update] Có phiên bản mới v{result.latest_version} (hiện tại v{result.current_version}).")
+            self.set_update_status("available")
+            if hasattr(self, "top_header"):
+                self._set_connection_chip("Có bản cập nhật", "warning")
+            self.append_log(
+                "warning",
+                "[cập nhật] Có phiên bản mới v{latest} (hiện tại v{current}).".format(latest=result.latest_version, current=result.current_version),
+            )
             if result.latest_version == self.skipped_update_version:
                 return
             if manual or self.update_prompted_version != result.latest_version:
                 self.update_prompted_version = result.latest_version
                 self.show_update_dialog(result)
         elif manual:
-            self.append_log("success", f"[update] Đang ở phiên bản mới nhất: v{self.current_version}")
+            self.set_update_status("uptodate")
+            if hasattr(self, "top_header"):
+                self._set_connection_chip("Đã là phiên bản mới nhất", "ok")
+            self.append_log("success", "[cập nhật] Đang ở phiên bản mới nhất: v{version}".format(version=self.current_version))
 
     def show_update_dialog(self, result: UpdateCheckResult):
         dialog = UpdateDialog(result.current_version, result.latest_version, result.manifest.release_notes, self)
@@ -1967,7 +1973,7 @@ class MainWindow(QMainWindow):
 
     def skip_update_version(self, version: str):
         self.skipped_update_version = version
-        self.append_log("info", f"[update] Đã bỏ qua phiên bản v{version}")
+        self.append_log("info", "[cập nhật] Đã bỏ qua phiên bản v{version}".format(version=version))
         if self.update_dialog:
             self.update_dialog.close()
 
@@ -1979,8 +1985,21 @@ class MainWindow(QMainWindow):
         if self.update_dialog:
             self.update_dialog.set_download_running(True)
             self.update_dialog.set_progress(0, "Đang tải bản cập nhật...")
+        if hasattr(self, "update_progress_bar"):
+            self.update_progress_bar.setValue(0)
+        if hasattr(self, "update_progress_meta"):
+            self.update_progress_meta.setText("Đã tải: 0% | Tốc độ: - | Thời gian còn lại: -")
 
-        self.update_download_thread = UpdateDownloadThread(manifest, str(target_dir), CONFIG_APP_NAME)
+        self.update_download_thread = UpdateDownloadThread(
+            manifest,
+            str(target_dir),
+            CONFIG_APP_NAME,
+            {
+                "cancelled": "Đã hủy tải cập nhật",
+                "sha_failed": "Xác minh SHA256 thất bại",
+                "verified": "Đã xác minh tải cập nhật",
+            },
+        )
         self.update_download_thread.download_progress.connect(self.on_update_download_progress)
         self.update_download_thread.download_finished.connect(self.on_update_download_finished)
         self.update_download_thread.finished.connect(self.update_download_thread.deleteLater)
@@ -1990,18 +2009,28 @@ class MainWindow(QMainWindow):
     def on_update_download_progress(self, percent: int, status: str):
         if self.update_dialog:
             self.update_dialog.set_progress(percent, status)
+        if hasattr(self, "update_progress_bar"):
+            self.update_progress_bar.setValue(max(0, min(int(percent), 100)))
+        if hasattr(self, "update_progress_meta"):
+            self.update_progress_meta.setText(
+                "Đã tải: {percent}% | {status}".format(percent=percent, status=status)
+            )
 
     def on_update_download_finished(self, success: bool, package_path: str, message: str):
         if success:
             self.downloaded_update_package = package_path
-            self.append_log("success", f"[update] Đã tải và xác minh SHA256: {package_path}")
+            self.append_log("success", "[cập nhật] Đã tải và xác minh SHA256: {path}".format(path=package_path))
+            self.set_update_status("available")
+            if hasattr(self, "install_update_button"):
+                self.install_update_button.setEnabled(True)
             if self.update_dialog:
                 self.update_dialog.set_progress(100, "Đã tải xong và xác minh SHA256. Sẵn sàng cài đặt.")
                 self.update_dialog.set_ready_to_install(True)
         else:
-            self.append_log("warning", f"[update] Tải cập nhật thất bại: {clean_log_text(message)}")
+            self.append_log("warning", "[cập nhật] Tải cập nhật thất bại: {error}".format(error=clean_log_text(message)))
+            self.set_update_status("failed")
             if self.update_dialog:
-                self.update_dialog.set_progress(0, f"Tải cập nhật thất bại: {clean_log_text(message)}")
+                self.update_dialog.set_progress(0, "Tải cập nhật thất bại: {message}".format(message=clean_log_text(message)))
                 self.update_dialog.set_download_running(False)
 
     def _clear_update_download_thread(self):
@@ -2010,22 +2039,22 @@ class MainWindow(QMainWindow):
     def cancel_update_download(self):
         if self.update_download_thread and self.update_download_thread.isRunning():
             self.update_download_thread.cancel()
-            self.append_log("warning", "[update] Đang hủy tải cập nhật...")
+            self.append_log("warning", "[cập nhật] Đang hủy tải cập nhật...")
 
     def install_downloaded_update(self):
         if not self.downloaded_update_package:
-            self.append_log("warning", "[update] Chưa có gói cập nhật đã tải.")
+            self.append_log("warning", "[cập nhật] Chưa có gói cập nhật đã tải.")
             return
         if self.active_threads:
-            self.append_log("warning", "[update] Hãy dừng hoặc đợi các task tải hoàn tất trước khi cài cập nhật.")
+            self.append_log("warning", "[cập nhật] Hãy dừng hoặc đợi các tác vụ tải hoàn tất trước khi cài cập nhật.")
             return
         try:
             launch_updater(self.downloaded_update_package, app_root(), restart=True)
         except Exception as err:
-            self.append_log("error", f"[update] Không thể mở updater: {clean_log_text(err)}")
+            self.append_log("error", "[cập nhật] Không thể mở updater: {error}".format(error=clean_log_text(err)))
             return
 
-        self.append_log("success", "[update] Đã mở DLP Master Updater. Ứng dụng chính sẽ đóng để cài cập nhật.")
+        self.append_log("success", "[cập nhật] Đã mở DLP Master Updater. Ứng dụng chính sẽ đóng để cài cập nhật.")
         if self.update_dialog:
             self.update_dialog.close()
         QTimer.singleShot(250, QApplication.instance().quit)
@@ -2041,7 +2070,7 @@ class MainWindow(QMainWindow):
             dialog.setStyleSheet(self.styleSheet())
             dialog.exec()
         except Exception as err:
-            QMessageBox.critical(self, "Lỗi đăng nhập", f"Không thể mở cửa sổ đăng nhập:\n{err}")
+            self.notify("Không thể mở cửa sổ đăng nhập: {error}".format(error=err), "error")
             return
 
         new_cookie_file = dialog.cookie_file_path
@@ -2056,12 +2085,16 @@ class MainWindow(QMainWindow):
             self.append_log("info", "[cài đặt] Đăng nhập nhúng thành công, đã cập nhật cookie tạm")
 
     def choose_download_directory(self):
-        current_dir = self.download_dir_input.text().strip() or self.get_default_download_dir()
-        selected_dir = QFileDialog.getExistingDirectory(self, "Chọn thư mục lưu video/audio", current_dir)
+        current_dir = self.settings.output_dir.strip() or self.get_default_download_dir()
+        selected_dir = QFileDialog.getExistingDirectory(self, "Chọn thư mục lưu video/âm thanh", current_dir)
         if selected_dir:
-            self.download_dir_input.setText(selected_dir)
+            if hasattr(self, "download_dir_input"):
+                self.download_dir_input.setText(selected_dir)
+            if hasattr(self, "output_path_input"):
+                self.output_path_input.setText(selected_dir)
             self.settings.output_dir = selected_dir
-            self.append_log("info", f"[cài đặt] Thư mục lưu mới: {selected_dir}")
+            self.append_log("info", "[cài đặt] Thư mục lưu mới: {path}".format(path=selected_dir))
+            self.refresh_storage_status()
 
     def append_log(self, level: str, message: str):
         colors = {"success": "#7cf2bf", "warning": "#ffd166", "error": "#ff7f7f", "info": "#dbe4ee"}
@@ -2075,28 +2108,28 @@ class MainWindow(QMainWindow):
 
     def clear_log(self):
         self.console.clear()
-        self.append_log("info", "[hệ thống] Log đã được xóa")
+        self.append_log("info", "Nhật ký đã được xóa.")
 
     def clear_completed_items(self):
         removed = 0
-        for task_id, item in list(self.queue_widgets.items()):
+        for task_id, row in list(self.queue_rows.items()):
             if task_id in self.active_threads:
                 continue
-            state = item.status.property("state")
-            if state not in {"done", "failed", "cancelled"}:
+            if row.status not in {"Done", "Failed", "Paused"}:
                 continue
-            self.queue_items_layout.removeWidget(item)
-            item.deleteLater()
-            del self.queue_widgets[task_id]
+            self.queue_table.remove_row_by_task_id(task_id)
+            del self.queue_rows[task_id]
             removed += 1
         if removed:
-            self.append_log("info", f"[hàng đợi] Đã xóa {removed} item")
+            self.append_log("info", "[hàng đợi] Đã xóa {count} mục".format(count=removed))
+        self._refresh_runtime_status()
 
     def stop_all_tasks(self):
         self.pending_queue.clear()
-        for task_id, item in self.queue_widgets.items():
-            if task_id not in self.active_threads and item.status.property("state") == "queued":
-                item.mark_cancelled()
+        for task_id, row in self.queue_rows.items():
+            if task_id not in self.active_threads and row.status == "Queued":
+                row.status = "Paused"
+                self._update_queue_row(task_id)
 
         for task_id, (thread, worker) in list(self.active_threads.items()):
             worker.stop()
@@ -2106,6 +2139,68 @@ class MainWindow(QMainWindow):
                 timer.timeout.connect(lambda task_id=task_id: self.force_terminate_task(task_id))
                 timer.start(3000)
                 self.force_stop_timers[task_id] = timer
+            self._refresh_runtime_status()
+
+    def pause_selected_task(self, task_id: str):
+        if not task_id:
+            self.notify("Hãy chọn một tác vụ trong bảng hàng đợi.", "warning")
+            return
+        pair = self.active_threads.get(task_id)
+        if pair:
+            _thread, worker = pair
+            worker.stop()
+            self.append_log("warning", "[hàng đợi] Tạm dừng tác vụ {task_id}".format(task_id=task_id))
+            return
+        row = self.queue_rows.get(task_id)
+        if row and row.status == "Queued":
+            row.status = "Paused"
+            self._update_queue_row(task_id)
+
+    def resume_selected_task(self, task_id: str):
+        if not task_id:
+            self.notify("Hãy chọn một tác vụ trong bảng hàng đợi.", "warning")
+            return
+        row = self.queue_rows.get(task_id)
+        if not row:
+            return
+        if row.status != "Paused":
+            self.notify("Tác vụ này không ở trạng thái tạm dừng.", "warning")
+            return
+        retry_task = DownloadTask(task_id=uuid.uuid4().hex[:8], url=row.url)
+        self.pending_queue.appendleft(retry_task)
+        self.add_queue_item(retry_task)
+        self.queue_table.remove_row_by_task_id(task_id)
+        del self.queue_rows[task_id]
+        self.pump_queue()
+
+    def retry_selected_task(self, task_id: str):
+        if not task_id:
+            self.notify("Hãy chọn một tác vụ trong bảng hàng đợi.", "warning")
+            return
+        if task_id in self.active_threads:
+            self.notify("Tác vụ đang chạy, chưa thể tải lại ngay.", "warning")
+            return
+        row = self.queue_rows.get(task_id)
+        if not row:
+            return
+        retry_task = DownloadTask(task_id=uuid.uuid4().hex[:8], url=row.url)
+        self.pending_queue.append(retry_task)
+        self.add_queue_item(retry_task)
+        self.append_log("info", "[hàng đợi] Tải lại từ tác vụ {from_task} -> {to_task}".format(from_task=task_id, to_task=retry_task.task_id))
+        self.pump_queue()
+
+    def delete_selected_task(self, task_id: str):
+        if not task_id:
+            self.notify("Hãy chọn một tác vụ trong bảng hàng đợi.", "warning")
+            return
+        if task_id in self.active_threads:
+            self.notify("Không thể xóa tác vụ đang chạy.", "warning")
+            return
+        self.pending_queue = deque([task for task in self.pending_queue if task.task_id != task_id])
+        self.queue_table.remove_row_by_task_id(task_id)
+        if task_id in self.queue_rows:
+            del self.queue_rows[task_id]
+        self._refresh_runtime_status()
 
     def force_terminate_task(self, task_id: str):
         pair = self.active_threads.get(task_id)
@@ -2120,7 +2215,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         if self.active_threads:
-            QMessageBox.information(self, "Đang tải", "Hãy đợi hoàn tất hoặc dừng các task trước khi đóng ứng dụng.")
+            self.notify("Hãy đợi hoàn tất hoặc dừng các tác vụ trước khi đóng ứng dụng.", "warning")
             event.ignore()
             return
 
@@ -2141,7 +2236,7 @@ def main():
     APP_INSTANCE_LOCK = QLockFile(lock_path)
     APP_INSTANCE_LOCK.setStaleLockTime(0)
     if not APP_INSTANCE_LOCK.tryLock(100):
-        QMessageBox.information(None, "Da mo san", "DLP Master dang chay o cua so khac.")
+        print("DLP Master dang chay o cua so khac.")
         return
 
     window = MainWindow()

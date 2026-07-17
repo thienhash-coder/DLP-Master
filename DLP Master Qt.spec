@@ -17,7 +17,10 @@ a = Analysis(
     ['yt_dlp_qt_gui.py'],
     pathex=[],
     binaries=bundled_binaries,
-    datas=[],
+    datas=[
+        ('theme\\dark.qss', 'theme'),
+        ('theme\\light.qss', 'theme'),
+    ],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

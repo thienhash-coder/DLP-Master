@@ -9,31 +9,33 @@ except ImportError:
 class UpdateDialog(QDialog):
     def __init__(self, current_version: str, latest_version: str, release_notes: str, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Cap nhat DLP Master")
+        self.setWindowTitle("Cập nhật DLP Master")
         self.resize(560, 360)
         self.setModal(True)
 
         layout = QVBoxLayout(self)
-        self.title = QLabel(f"DLP Master v{latest_version} da san sang")
+        self.title = QLabel(f"DLP Master v{latest_version} đã sẵn sàng")
         self.title.setObjectName("SectionTitle")
-        self.version_label = QLabel(f"Phien ban hien tai: v{current_version} | Moi nhat: v{latest_version}")
+        self.version_label = QLabel(
+            f"Phiên bản hiện tại: v{current_version} | Mới nhất: v{latest_version}"
+        )
         self.notes = QTextBrowser()
         self.notes.setOpenExternalLinks(True)
-        self.notes.setPlainText(release_notes or "Khong co ghi chu phien ban.")
+        self.notes.setPlainText(release_notes or "Không có ghi chú phiên bản.")
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
-        self.status = QLabel("San sang tai cap nhat.")
+        self.status = QLabel("Sẵn sàng tải cập nhật.")
         self.status.setWordWrap(True)
 
         buttons = QHBoxLayout()
         buttons.addStretch(1)
-        self.skip_button = QPushButton("Skip Version")
-        self.later_button = QPushButton("Remind Later")
-        self.download_button = QPushButton("Download")
-        self.install_button = QPushButton("Install")
-        self.cancel_button = QPushButton("Cancel")
+        self.skip_button = QPushButton("Bỏ qua phiên bản")
+        self.later_button = QPushButton("Nhắc sau")
+        self.download_button = QPushButton("Tải xuống")
+        self.install_button = QPushButton("Cài đặt")
+        self.cancel_button = QPushButton("Hủy")
         self.install_button.setEnabled(False)
         self.cancel_button.setEnabled(False)
 

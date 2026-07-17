@@ -1,0 +1,335 @@
+QWidget {
+    background-color: {{BG}};
+    color: {{TEXT}};
+    font-family: "Segoe UI";
+    font-size: 10pt;
+}
+
+QWidget:focus {
+    outline: none;
+}
+
+QFrame#Sidebar {
+    background: #191a1c;
+    border: 1px solid {{BORDER}};
+    border-radius: 14px;
+}
+
+QFrame#SidebarBrand {
+    background: {{CARD}};
+    border: 1px solid {{BORDER}};
+    border-radius: 10px;
+}
+
+QLabel#SidebarTitle {
+    font-size: 12pt;
+    font-weight: 700;
+    color: #f4f8fc;
+}
+
+QLabel#SidebarSubtitle {
+    color: #9ca3af;
+    font-size: 9pt;
+}
+
+QPushButton#SidebarButton {
+    text-align: left;
+    border: 1px solid transparent;
+    border-radius: 10px;
+    background: {{SURFACE}};
+    color: #c8d1dc;
+    padding: 10px 12px;
+    min-height: 40px;
+}
+
+QPushButton#SidebarButton:hover {
+    background: {{HOVER}};
+    border-color: #3a3a3f;
+}
+
+QPushButton#SidebarButton:checked {
+    background: #23344a;
+    color: #e9f3ff;
+    border-color: {{ACCENT}};
+}
+
+QPushButton#SidebarActionButton {
+    text-align: left;
+    border-radius: 10px;
+    padding: 10px 12px;
+    background: #1d2734;
+    border: 1px solid #31445c;
+    color: #cde4ff;
+    font-weight: 600;
+}
+
+QPushButton#SidebarActionButton:hover {
+    background: #25364c;
+    border-color: #3b82f6;
+}
+
+QFrame#TopHeader {
+    background: {{CARD}};
+    border: 1px solid {{BORDER}};
+    border-radius: 14px;
+}
+
+QLabel#HeaderLogo {
+    background: #3b82f6;
+    color: #ffffff;
+    border-radius: 8px;
+    min-width: 34px;
+    min-height: 26px;
+    font-size: 10pt;
+    font-weight: 700;
+    padding: 2px 4px;
+}
+
+QLabel#HeaderTitle {
+    font-size: 12pt;
+    font-weight: 700;
+    color: #f4f8fc;
+}
+
+QLabel#HeaderVersion {
+    color: {{MUTED}};
+    font-weight: 600;
+}
+
+QFrame#HeaderChip {
+    background: #1f2023;
+    border-radius: 9px;
+    border: 1px solid #2e2f33;
+}
+
+QFrame#HeaderChip[state="ok"] {
+    border-color: #2f855a;
+    background: #1f2f28;
+}
+
+QFrame#HeaderChip[state="warning"] {
+    border-color: #b7791f;
+    background: #322915;
+}
+
+QFrame#HeaderChip[state="error"] {
+    border-color: #c53030;
+    background: #3a1f1f;
+}
+
+QLabel#HeaderChipTitle {
+    color: #9ca3af;
+}
+
+QLabel#HeaderChipValue {
+    color: #ecf3fb;
+    font-weight: 600;
+}
+
+QFrame#Card {
+    background: {{CARD}};
+    border: 1px solid {{BORDER}};
+    border-radius: 14px;
+}
+
+QLabel#CardTitle,
+QLabel#SectionTitle {
+    font-size: 11pt;
+    font-weight: 700;
+    color: #f4f8fc;
+}
+
+QLineEdit,
+QComboBox,
+QTextEdit,
+QTextBrowser {
+    background: {{SURFACE}};
+    border: 1px solid #323337;
+    border-radius: 10px;
+    color: #e6edf3;
+    padding: 8px 10px;
+    min-height: 20px;
+}
+
+QLineEdit:focus,
+QComboBox:focus,
+QTextEdit:focus,
+QTextBrowser:focus,
+QPushButton:focus {
+    border: 1px solid {{ACCENT}};
+    background: #232429;
+}
+
+QCheckBox {
+    spacing: 8px;
+}
+
+QCheckBox::indicator {
+    width: 16px;
+    height: 16px;
+    border: 1px solid #4a4c52;
+    border-radius: 4px;
+    background: #1f2023;
+}
+
+QCheckBox::indicator:checked {
+    background: {{ACCENT}};
+    border-color: {{ACCENT}};
+}
+
+QPushButton {
+    background: #2a2c30;
+    border: 1px solid #3a3c40;
+    border-radius: 10px;
+    color: #d6dee8;
+    padding: 8px 12px;
+}
+
+QPushButton:hover {
+    background: #313338;
+}
+
+QPushButton#StartButton {
+    background: #3b82f6;
+    border: 1px solid #3b82f6;
+    color: #ffffff;
+    font-weight: 700;
+}
+
+QPushButton#StartButton:hover {
+    background: #4a8ef7;
+}
+
+QPushButton#QueueDangerButton {
+    background: #3a1f1f;
+    border: 1px solid #9b3f3f;
+    color: #ffd5d5;
+}
+
+QProgressBar {
+    border: 1px solid #3a3c40;
+    border-radius: 8px;
+    background: #1d1e21;
+    text-align: center;
+}
+
+QProgressBar::chunk {
+    background: {{ACCENT}};
+    border-radius: 7px;
+}
+
+QToolTip {
+    background: #111318;
+    color: #e6edf3;
+    border: 1px solid #3a3c40;
+    padding: 6px 8px;
+}
+
+QFrame#BottomStatusBar {
+    background: {{CARD}};
+    border: 1px solid {{BORDER}};
+    border-radius: 12px;
+}
+
+QLabel#BottomStatusItem {
+    color: #c8d1dc;
+    font-size: 9pt;
+}
+
+QFrame#Toast {
+    border-radius: 12px;
+    border: 1px solid #3a3c40;
+    background: #252526;
+}
+
+QFrame#Toast[level="success"] {
+    border-color: #2f855a;
+}
+
+QFrame#Toast[level="warning"] {
+    border-color: #b7791f;
+}
+
+QFrame#Toast[level="error"] {
+    border-color: #c53030;
+}
+
+QLabel#ToastMessage {
+    color: #f2f7fd;
+    font-size: 9.5pt;
+}
+
+QFrame#QueueItem {
+    background: #1f2023;
+    border: 1px solid #2f3034;
+    border-radius: 10px;
+}
+
+QLabel#QueueTitle {
+    color: #ecf3fb;
+    font-weight: 600;
+}
+
+QLabel#QueueStatus {
+    color: #b8cde4;
+    background: #25364c;
+    border: 1px solid #365273;
+    border-radius: 8px;
+    padding: 2px 8px;
+}
+
+QLabel#QueueStatus[state="done"] {
+    color: #b9f4d5;
+    background: #1f2f28;
+    border-color: #2f855a;
+}
+
+QLabel#QueueStatus[state="failed"] {
+    color: #ffd1d1;
+    background: #3a1f1f;
+    border-color: #c53030;
+}
+
+QLabel#QueueStatus[state="cancelled"] {
+    color: #f8dbb6;
+    background: #3a2b1f;
+    border-color: #b7791f;
+}
+
+QLabel#QueueStatus[state="running"] {
+    color: #d7e9ff;
+    background: #23344a;
+    border-color: #3b82f6;
+}
+
+QTableWidget#QueueTable {
+    border: 1px solid #323337;
+    border-radius: 10px;
+    background: #1f2023;
+    gridline-color: #2d2d30;
+    selection-background-color: #2b3e56;
+    selection-color: #f2f7fd;
+    alternate-background-color: #232429;
+}
+
+QTableWidget#QueueTable::item {
+    padding: 6px;
+}
+
+QTableWidget#QueueTable::item:selected {
+    background: #2b3e56;
+}
+
+QTableCornerButton::section {
+    background: #252526;
+    border: none;
+    border-bottom: 1px solid #2d2d30;
+}
+
+QHeaderView::section {
+    background: #252526;
+    color: #c8d1dc;
+    border: none;
+    border-bottom: 1px solid #2d2d30;
+    padding: 8px;
+}
